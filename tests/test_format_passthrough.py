@@ -27,8 +27,8 @@ def _assert_match(src: Path, *outs: Path) -> None:
 def test_write_wav_matching_preserves_pcm16_and_pcm24(tmp_path: Path) -> None:
     p16 = tmp_path / "a16.wav"
     p24 = tmp_path / "a24.wav"
-    synthesize_dropout_wav(p16, sample_rate=44100, duration_s=0.5, stereo=True, subtype="PCM_16")
-    synthesize_dropout_wav(p24, sample_rate=88200, duration_s=0.5, stereo=True, subtype="PCM_24")
+    synthesize_dropout_wav(p16, sample_rate=44100, duration_s=2.0, stereo=True, subtype="PCM_16")
+    synthesize_dropout_wav(p24, sample_rate=88200, duration_s=2.0, stereo=True, subtype="PCM_24")
     for src in (p16, p24):
         wav = read_wav(src)
         out = tmp_path / f"out_{src.name}"
