@@ -161,7 +161,8 @@ def build_app():
 # mtdrop — local listen UI
 Full-file detect → optional azimuth/level correct → optional repair.
 
-**Source WAV is never overwritten.** Derived files download from the panel below.
+**Source WAV is never overwritten.** Derived corrected/repaired downloads keep the
+**same sample rate, bit depth, and channel count** as the input (e.g. 88.2 kHz/24-bit → 88.2/24).
             """
         )
         with gr.Row():

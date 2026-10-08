@@ -5,9 +5,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-import soundfile as sf
 
-from mtdrop.wav_io import WavAudio, channel_matrix
+from mtdrop.wav_io import WavAudio, channel_matrix, write_wav_matching
 
 CorrectTarget = Literal["azimuth", "level"]
 
@@ -201,15 +200,23 @@ def apply_corrections(
         }
 
     out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    write_subtype = subtype or wav.subtype or "PCM_24"
-    # Prefer PCM_24 for archive-derived; fall back if float
-    if write_subtype.upper() not in {"PCM_16", "PCM_24", "PCM_32", "FLOAT"}:
-        write_subtype = "PCM_24"
-    sf.write(str(out_path), x.astype(np.float32), wav.sample_rate, subtype=write_subtype)
+    # Hard rule: derived WAV matches input sr / bit depth / channels exactly.
+    # Optional subtype override only if caller passes an explicit PCM subtype.
+    like = wav
+    if subtype is not None:
+        from mtdrop.wav_io import WavFormat, _subtype_bit_depth
+
+        like = WavFormat(
+            sample_rate=wav.sample_rate,
+            channels=wav.channels,
+            subtype=subtype.upper(),
+            bit_depth=_subtype_bit_depth(subtype.upper()),
+        )
+    written = write_wav_matching(out_path, x, like=like)
     applied["output_wav"] = str(out_path)
     applied["source_wav"] = str(wav.path)
     applied["frames_out"] = int(x.shape[0])
+    applied["format"] = written.to_dict()
     return applied
 
 

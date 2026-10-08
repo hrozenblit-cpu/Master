@@ -17,10 +17,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-import soundfile as sf
 
 from mtdrop.models import AnalysisReport, DropoutEvent
-from mtdrop.wav_io import WavAudio, channel_matrix
+from mtdrop.wav_io import WavAudio, WavFormat, channel_matrix, write_wav_matching, _subtype_bit_depth
 
 RepairMode = Literal["off", "conservative", "preview"]
 
@@ -237,11 +236,16 @@ def apply_repairs(
         x *= 0.99 / peak
 
     out_wav = Path(out_wav)
-    out_wav.parent.mkdir(parents=True, exist_ok=True)
-    write_subtype = subtype or wav.subtype or "PCM_24"
-    if write_subtype.upper() not in {"PCM_16", "PCM_24", "PCM_32", "FLOAT"}:
-        write_subtype = "PCM_24"
-    sf.write(str(out_wav), x.astype(np.float32), sr, subtype=write_subtype)
+    # Hard rule: derived WAV matches input sr / bit depth / channels exactly.
+    like: WavAudio | WavFormat = wav
+    if subtype is not None:
+        like = WavFormat(
+            sample_rate=wav.sample_rate,
+            channels=wav.channels,
+            subtype=subtype.upper(),
+            bit_depth=_subtype_bit_depth(subtype.upper()),
+        )
+    written = write_wav_matching(out_wav, x, like=like)
 
     plan.repaired_count = len(applied)
     plan.output_wav = str(out_wav)
@@ -256,6 +260,7 @@ def apply_repairs(
         "output_wav": str(out_wav),
         "mode": mode,
         "stereo_relationship": report.stereo_relationship,
+        "format": written.to_dict(),
         "repaired_events": applied,
         "policy": "Derived WAV only; masters never overwritten.",
         "calibration_note": (

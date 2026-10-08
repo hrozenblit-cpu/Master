@@ -86,9 +86,12 @@ mtdrop preview \
 
 **Calibration note:** defaults tuned on the synthetic fixture **and** Helio `exemplo_1_18` (full-track mono → A80 two-track). `dual_mono_like` prefers cross-channel borrow. **Not production-ready** — more reels + listen sign-off needed.
 
-## Supported input
+## Supported input / output format (hard rule)
 
 - WAV PCM, mono or stereo, ≤192 kHz, ≤24-bit
+- **Derived WAVs match the input exactly:** same sample rate, PCM bit depth, and channel count  
+  (88.2 kHz / 24-bit → 88.2 / 24; 44.1 kHz / 16-bit → 44.1 / 16). No silent resample or bit-depth change.
+- Applies to `*.corrected.wav`, `*.repaired.wav`, and UI downloads of those files.
 
 ## Tests
 
