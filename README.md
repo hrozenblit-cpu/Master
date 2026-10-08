@@ -51,7 +51,7 @@ mtdrop analyze /path/to/transfers/ --out ./reports --repair conservative
 - **STFT fill** for longer gaps
 - **HF-band reconstruct** for tape-clog (keep LF, rebuild HF)
 
-**Calibration note:** thresholds are tuned on the synthetic fixture. A real Studer A80 sample from Helio should calibrate gates before production use.
+**Calibration note:** defaults tuned on the synthetic fixture **and** Helio `exemplo_1_18` (full-track mono → A80 two-track). `dual_mono_like` prefers cross-channel borrow. **Not production-ready** — more reels + listen sign-off needed.
 
 ## Supported input
 
@@ -70,3 +70,4 @@ pytest -q
 | A — detect + markers + azimuth/level measure | Ships |
 | B — gated `--correct` → derived WAV | Ships |
 | C — gated `--repair` → derived repaired WAV | Ships (conservative); long gaps / ML / GUI next |
+| Calibration on Helio full-track→two-track clip | First pass done; more A80 reels needed |
