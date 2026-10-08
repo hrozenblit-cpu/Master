@@ -31,7 +31,7 @@ def _ensure_fixture() -> Path:
 def test_fixture_detects_core_dropout_types(tmp_path: Path) -> None:
     wav_path = _ensure_fixture()
     wav = read_wav(wav_path)
-    report = analyze(wav, DetectConfig(severity_threshold=0.12, min_duration_s=0.003))
+    report = analyze(wav, DetectConfig(severity_threshold=0.12, min_duration_s=0.003, hf_ratio_drop=0.35, dip_ratio=0.35))
 
     types = {e.type for e in report.events}
     assert "hard_mute" in types

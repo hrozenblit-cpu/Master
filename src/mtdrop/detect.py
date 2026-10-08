@@ -20,19 +20,25 @@ class DetectConfig:
     frame_ms: float = 5.0
     hop_ms: float = 2.5
     baseline_ms: float = 400.0
-    # Relative RMS below adaptive baseline (linear ratio). 0.35 ≈ -9 dB.
-    dip_ratio: float = 0.35
+    # Relative RMS below adaptive baseline (linear ratio). 0.30 ≈ -10.5 dB.
+    # Calibrated on Helio exemplo_1_18 (full-track→A80 two-track); was 0.35 on synth.
+    dip_ratio: float = 0.30
     # Absolute hard-mute floor (linear full-scale).
     mute_floor: float = 1e-4  # ≈ -80 dBFS
-    # HF/LF ratio collapse vs local baseline (relative).
-    hf_ratio_drop: float = 0.35
+    # HF collapse vs local baseline (relative). Calibrated: 0.35 was far too sensitive
+    # on real tape (musical HF variation → mass FP); 0.22 keeps strong clog events.
+    hf_ratio_drop: float = 0.22
+    # Also require absolute HF energy collapse (not only HF/LF ratio).
+    hf_abs_drop: float = 0.30
     # Minimum event length to keep (seconds).
-    min_duration_s: float = 0.003
+    min_duration_s: float = 0.005
     # Merge gaps shorter than this (seconds).
-    merge_gap_s: float = 0.008
+    merge_gap_s: float = 0.010
     # Asymmetry: other channel must stay above this fraction of its baseline.
     asym_other_keep: float = 0.7
-    severity_threshold: float = 0.15
+    severity_threshold: float = 0.25
+    # Correlation floor for dual_mono_like hint (full-track mono→two-track often ~0.90–0.98).
+    dual_mono_corr: float = 0.90
 
 
 def analyze(wav: WavAudio, config: DetectConfig | None = None) -> AnalysisReport:
@@ -61,10 +67,19 @@ def analyze(wav: WavAudio, config: DetectConfig | None = None) -> AnalysisReport
         hf_ratio = hf / lf_safe
         hf_base = _moving_percentile(hf_ratio, baseline_frames, q=0.6)
         hf_base = np.maximum(hf_base, 1e-8)
-        # HF collapse while LF remains near baseline
+        hf_abs_base = _moving_percentile(hf, baseline_frames, q=0.6)
+        hf_abs_base = np.maximum(hf_abs_base, 1e-10)
+        # HF collapse while LF remains near baseline — require BOTH ratio and abs HF drop
+        # (ratio-only FPs when LF swells or musical HF dips without clog).
         lf_base = _moving_percentile(lf, baseline_frames, q=0.6)
         lf_ok = lf > (np.maximum(lf_base, 1e-10) * 0.5)
-        hf_mask = (hf_ratio < hf_base * cfg.hf_ratio_drop) & lf_ok & ~mute_mask
+        hf_mask = (
+            (hf_ratio < hf_base * cfg.hf_ratio_drop)
+            & (hf < hf_abs_base * cfg.hf_abs_drop)
+            & lf_ok
+            & ~mute_mask
+            & ~dip_mask
+        )
 
         ch_events: list[tuple[int, int, float, DropoutType]] = []
         ch_events.extend(_mask_to_spans(mute_mask, "hard_mute", severity_from=lambda s, e: 1.0))
@@ -95,7 +110,7 @@ def analyze(wav: WavAudio, config: DetectConfig | None = None) -> AnalysisReport
     else:
         # Never assume L==R: always keep per-channel hits, plus joint/asymmetry overlays.
         events.extend(_stereo_report(per_ch_dips[0], per_ch_dips[1], hop, sr, cfg))
-        relationship, corr = _stereo_relationship(x[:, 0], x[:, 1])
+        relationship, corr = _stereo_relationship(x[:, 0], x[:, 1], cfg.dual_mono_corr)
 
     events = [e for e in events if e.severity >= cfg.severity_threshold and e.duration_s >= cfg.min_duration_s]
     events.sort(key=lambda e: (e.start_sample, e.channel, e.type))
@@ -276,8 +291,17 @@ def _make_event(
     )
 
 
-def _stereo_relationship(left: np.ndarray, right: np.ndarray) -> tuple[StereoRelationship, float]:
-    """Correlation hint only — never used to skip a channel or assume shared content."""
+def _stereo_relationship(
+    left: np.ndarray,
+    right: np.ndarray,
+    dual_mono_corr: float = 0.90,
+) -> tuple[StereoRelationship, float]:
+    """Correlation hint only — never used to skip a channel or assume shared content.
+
+    dual_mono_like covers: intentional dual-mono masters AND full-track mono tape
+    digitized as two-track (Studer A80), where L≈R program and differences are mostly
+    azimuth, channel gain, and dropout asymmetry — not stereo imaging.
+    """
     n = min(left.size, right.size)
     if n < 8:
         return "unknown", 0.0
@@ -291,8 +315,7 @@ def _stereo_relationship(left: np.ndarray, right: np.ndarray) -> tuple[StereoRel
     if denom < 1e-12:
         return "unknown", 0.0
     corr = float(np.dot(a, b) / denom)
-    # High correlation → dual-mono-like; lower → true stereo (different L/R content).
-    if corr >= 0.92:
+    if corr >= dual_mono_corr:
         return "dual_mono_like", corr
     return "true_stereo", corr
 

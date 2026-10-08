@@ -8,8 +8,8 @@ Conservative strategies:
 - HF-band reconstruct for tape-clog (hf_loss)
 - cross-channel borrow when the other channel is clean (dual-mono or true stereo)
 
-Thresholds are tuned on a synthetic fixture; a real Studer A80 sample from Helio
-should calibrate severity/duration gates before production use.
+Defaults calibrated on Helio exemplo_1_18 (full-track mono → Studer A80 two-track)
+plus the synthetic fixture. Still not production-certified — more reels needed.
 """
 
 from dataclasses import dataclass, field
@@ -25,9 +25,15 @@ from mtdrop.wav_io import WavAudio, channel_matrix
 RepairMode = Literal["off", "conservative", "preview"]
 
 # Duration caps (seconds). preview is slightly more permissive.
+# For dual_mono_like / full-track→two-track, longer asymmetric events can still
+# borrow from the clean sibling — see _choose_strategy.
 _MAX_DUR = {
-    "conservative": {"hard_mute": 0.08, "level_dip": 0.10, "hf_loss": 0.12},
-    "preview": {"hard_mute": 0.15, "level_dip": 0.20, "hf_loss": 0.25},
+    "conservative": {"hard_mute": 0.10, "level_dip": 0.12, "hf_loss": 0.15},
+    "preview": {"hard_mute": 0.20, "level_dip": 0.25, "hf_loss": 0.30},
+}
+_MAX_DUR_BORROW = {
+    "conservative": {"hard_mute": 0.25, "level_dip": 0.30, "hf_loss": 0.35},
+    "preview": {"hard_mute": 0.40, "level_dip": 0.50, "hf_loss": 0.50},
 }
 
 
@@ -54,8 +60,8 @@ class RepairPlan:
             "strategies": self.strategies,
             "events": [e.to_dict() for e in self.events_selected],
             "calibration_note": (
-                "Thresholds validated on synthetic fixture only. "
-                "A real Studer A80 sample from Helio should calibrate gates before production."
+                "Calibrated on synthetic fixture + Helio exemplo_1_18 "
+                "(full-track mono digitized as A80 two-track). More reels needed; not production-ready."
             ),
         }
 
@@ -89,6 +95,8 @@ def plan_repairs(
         )
 
     caps = _MAX_DUR[mode]
+    borrow_caps = _MAX_DUR_BORROW[mode]
+    dual_mono = report.stereo_relationship == "dual_mono_like"
     selected: list[DropoutEvent] = []
     strategies: list[dict[str, Any]] = []
     deferred = 0
@@ -108,7 +116,10 @@ def plan_repairs(
             strategies.append(_strat(ev, "skip_overlap", "planned", reason="overlaps larger event"))
             deferred += 1
             continue
-        max_d = caps.get(ev.type, 0.08)
+
+        strat = _choose_strategy(ev, report)
+        # Full-track→two-track / dual-mono: allow longer repairs when borrowing from clean sibling
+        max_d = borrow_caps.get(ev.type, 0.25) if strat == "cross_channel_borrow" else caps.get(ev.type, 0.08)
         if ev.duration_s > max_d:
             strategies.append(
                 _strat(ev, "defer_manual", "deferred", reason=f"duration {ev.duration_s:.4f}s > {max_d}s")
@@ -116,9 +127,15 @@ def plan_repairs(
             deferred += 1
             continue
 
-        strat = _choose_strategy(ev, report)
+        if dual_mono and strat == "cross_channel_borrow":
+            notes_extra = "dual_mono_like prefer borrow"
+        else:
+            notes_extra = ""
         selected.append(ev)
-        strategies.append(_strat(ev, strat, "planned"))
+        s = _strat(ev, strat, "planned")
+        if notes_extra:
+            s["note"] = notes_extra
+        strategies.append(s)
         claimed.append((ev.channel, ev.start_sample, ev.end_sample))
 
     return RepairPlan(
@@ -240,7 +257,12 @@ def apply_repairs(
         "repaired_events": applied,
         "policy": "Derived WAV only; masters never overwritten.",
         "calibration_note": (
-            "Synthetic-fixture tuned. Real Studer A80 sample from Helio should calibrate thresholds."
+            "Calibrated on synthetic fixture + Helio exemplo_1_18 "
+            "(full-track mono → A80 two-track). More reels needed; not production-ready."
+        ),
+        "transfer_model": (
+            "dual_mono_like prefers cross-channel borrow when donor is clean "
+            "(typical of full-track mono digitized as two-track)."
         ),
     }
     return RepairResult(plan=plan, samples=x, sample_rate=sr, provenance=provenance)
@@ -272,31 +294,40 @@ def _overlaps_claimed(ev: DropoutEvent, claimed: list[tuple[str, int, int]]) -> 
 
 
 def _choose_strategy(ev: DropoutEvent, report: AnalysisReport) -> str:
-    if ev.type == "hf_loss":
-        # Prefer borrow for single-channel HF clog when donor is clean
-        if ev.channel in {"L", "R"} and _donor_clean(ev, report):
-            return "cross_channel_borrow"
-        return "hf_band_reconstruct"
-    if ev.channel in {"L", "R"} and _donor_clean(ev, report):
+    dual_mono = report.stereo_relationship == "dual_mono_like"
+    # Full-track mono→two-track / dual-mono: prefer cross-channel borrow whenever donor is usable.
+    if ev.channel in {"L", "R"} and _donor_usable(ev, report, dual_mono=dual_mono):
         return "cross_channel_borrow"
+    if ev.type == "hf_loss":
+        return "hf_band_reconstruct"
     if ev.duration_s >= 0.012:
         return "stft_interp"
     return "cubic_interp"
 
 
-def _donor_clean(ev: DropoutEvent, report: AnalysisReport) -> bool:
-    """True if the other channel has no overlapping morphology hit (safe to borrow)."""
+def _donor_usable(ev: DropoutEvent, report: AnalysisReport, *, dual_mono: bool) -> bool:
+    """True if the other channel is safe enough to borrow from.
+
+    Strict: no overlapping morphology on donor.
+    dual_mono_like (incl. full-track→two-track): also allow if donor overlap is much milder.
+    """
     if report.channels < 2 or ev.channel not in {"L", "R"}:
         return False
     other = "R" if ev.channel == "L" else "L"
-    for e in report.events:
-        if e.channel != other:
-            continue
-        if e.type not in {"level_dip", "hard_mute", "hf_loss"}:
-            continue
-        if e.start_sample < ev.end_sample and e.end_sample > ev.start_sample:
-            return False
-    return True
+    overlapping = [
+        e
+        for e in report.events
+        if e.channel == other
+        and e.type in {"level_dip", "hard_mute", "hf_loss"}
+        and e.start_sample < ev.end_sample
+        and e.end_sample > ev.start_sample
+    ]
+    if not overlapping:
+        return True
+    if not dual_mono:
+        return False
+    # Donor usable if every overlapping hit is clearly milder
+    return all(e.severity <= ev.severity * 0.55 for e in overlapping)
 
 
 def _channel_index(tag: str, n_ch: int) -> int | None:

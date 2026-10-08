@@ -69,7 +69,9 @@ class AnalysisReport:
             "channel_correlation": self.channel_correlation,
             "notes": (
                 "Per-channel detection never assumes L==R. "
-                "stereo_relationship is a correlation hint only."
+                "stereo_relationship is a correlation hint only: "
+                "dual_mono_like includes full-track mono tape digitized as two-track "
+                "(L≈R program; differences from azimuth/gain/dropout asymmetry)."
             ),
             "event_count": len(self.events),
             "events": [e.to_dict() for e in self.events],
