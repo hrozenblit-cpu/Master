@@ -10,8 +10,8 @@ from mtdrop.align import measure_azimuth, measure_level, apply_corrections
 from mtdrop.detect import DetectConfig, analyze
 from mtdrop.export import write_report_bundle
 from mtdrop.fixture import synthesize_dropout_wav
-from mtdrop.repair import plan_repairs
-from mtdrop.wav_io import read_wav
+from mtdrop.repair import apply_repairs, plan_repairs
+from mtdrop.wav_io import WavAudio, read_wav
 
 FIXTURE = Path(__file__).parent / "fixtures" / "synth_dropouts_48k_stereo.wav"
 
@@ -38,7 +38,6 @@ def test_fixture_detects_core_dropout_types(tmp_path: Path) -> None:
     assert "level_dip" in types
     assert "hf_loss" in types or "channel_asymmetry" in types
 
-    # Per-channel events must exist for stereo (never assume L==R / merge-only)
     channels = {e.channel for e in report.events}
     assert "L" in channels and "R" in channels
 
@@ -57,9 +56,7 @@ def test_azimuth_and_level_measure() -> None:
     az = measure_azimuth(wav)
     lvl = measure_level(wav)
     assert az is not None and lvl is not None
-    # Injected +3 samples R lag
     assert abs(az.lag_samples - 3.0) < 0.75
-    # Injected R quieter by ~2.5 dB => L−R positive
     assert lvl.lr_rms_diff_db > 1.0
 
 
@@ -77,16 +74,13 @@ def test_correct_writes_derived_wav(tmp_path: Path) -> None:
         out_path=out,
     )
     assert out.exists()
-    assert Path(wav_path).stat().st_mtime <= out.stat().st_mtime or True
-    # Source unchanged size
     assert wav_path.exists()
     corr, sr = sf.read(str(out), always_2d=True)
     assert sr == 48000
     assert corr.shape[1] == 2
-    # After correction, lag should collapse toward 0
-    from mtdrop.wav_io import WavAudio
-
-    fixed = WavAudio(path=out, samples=corr.astype(np.float32), sample_rate=sr, channels=2, bit_depth=24, subtype="PCM_24")
+    fixed = WavAudio(
+        path=out, samples=corr.astype(np.float32), sample_rate=sr, channels=2, bit_depth=24, subtype="PCM_24"
+    )
     az2 = measure_azimuth(fixed)
     assert az2 is not None
     assert abs(az2.lag_samples) < abs(az.lag_samples) * 0.5 + 0.5
@@ -94,15 +88,35 @@ def test_correct_writes_derived_wav(tmp_path: Path) -> None:
     assert applied["level"] is not None
 
 
-def test_repair_plan_scaffold() -> None:
-    wav = read_wav(_ensure_fixture())
+def test_repair_applies_and_fills_hard_mute(tmp_path: Path) -> None:
+    wav_path = _ensure_fixture()
+    wav = read_wav(wav_path)
     report = analyze(wav)
     plan = plan_repairs(report, mode="conservative")
-    assert plan.status == "planned_only"
-    assert plan.to_dict()["event_count"] >= 1
+    assert plan.status == "planned"
+    assert len(plan.events_selected) >= 1
+
+    out = tmp_path / "out.repaired.wav"
+    result = apply_repairs(wav, report, out, mode="conservative")
+    assert out.exists()
+    assert result.plan.status == "applied"
+    assert result.plan.repaired_count >= 1
+    assert result.provenance["repaired_events"]
+
+    # Source untouched: repaired is a different path
+    assert Path(result.provenance["source_wav"]).resolve() != out.resolve()
+
+    # Hard mute region (~0.90–0.925) should have higher energy after repair
+    sr = wav.sample_rate
+    a, b = int(0.90 * sr), int(0.925 * sr)
+    raw = wav.samples if wav.samples.ndim == 2 else wav.samples.reshape(-1, 1)
+    rep, _ = sf.read(str(out), always_2d=True)
+    raw_e = float(np.mean(raw[a:b] ** 2))
+    rep_e = float(np.mean(rep[a:b] ** 2))
+    assert rep_e > raw_e * 5.0
 
 
-def test_cli_analyze_with_correct(tmp_path: Path) -> None:
+def test_cli_analyze_correct_and_repair(tmp_path: Path) -> None:
     from mtdrop.cli import main
 
     wav_path = _ensure_fixture()
@@ -124,7 +138,9 @@ def test_cli_analyze_with_correct(tmp_path: Path) -> None:
     assert list(out.glob("*.dropouts.json"))
     assert list(out.glob("*.alignment.json"))
     assert list(out.glob("*.corrected.wav"))
-    assert list(out.glob("*.repair-plan.json"))
-    align = json.loads(next(out.glob("*.alignment.json")).read_text())
-    assert align["azimuth"]["lag_samples"] is not None
-    assert align["applied"]["azimuth"] is not None
+    assert list(out.glob("*.repaired.wav"))
+    assert list(out.glob("*.repair.json"))
+    repair = json.loads(next(out.glob("*.repair.json")).read_text())
+    assert repair["status"] == "applied"
+    assert repair["repaired_count"] >= 1
+    assert "calibration_note" in repair

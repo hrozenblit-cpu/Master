@@ -54,7 +54,7 @@ class AnalysisReport:
     stereo_relationship: StereoRelationship = "unknown"
     channel_correlation: float | None = None
     tool: str = "mtdrop"
-    tool_version: str = "0.1.0"
+    tool_version: str = "0.2.0"
 
     def to_dict(self) -> dict[str, Any]:
         return {

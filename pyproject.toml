@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtdrop"
-version = "0.1.0"
+version = "0.2.0"
 description = "Master Tools v1 — magnetic-tape audio dropout detector and marker exporter"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -10,7 +10,7 @@ from mtdrop.align import AlignmentReport, apply_corrections, measure_azimuth, me
 from mtdrop.detect import DetectConfig, analyze
 from mtdrop.export import write_json_obj, write_report_bundle
 from mtdrop.fixture import synthesize_dropout_wav
-from mtdrop.repair import plan_repairs
+from mtdrop.repair import apply_repairs
 from mtdrop.wav_io import read_wav
 
 
@@ -18,7 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="mtdrop",
         description=(
-            "Master Tools — tape dropout detect/measure/correct. "
+            "Master Tools — tape dropout detect/measure/correct/repair. "
             "Never overwrites source masters; writes derived WAVs + reports under --out."
         ),
     )
@@ -27,13 +27,13 @@ def main(argv: list[str] | None = None) -> int:
 
     analyze_p = sub.add_parser(
         "analyze",
-        help="Detect dropouts, measure azimuth/level, optional gated correction (Phase A+B)",
+        help="Detect dropouts, measure azimuth/level, optional correct + repair (Phases A–C)",
     )
     _add_analyze_args(analyze_p)
 
     detect_p = sub.add_parser(
         "detect",
-        help="Alias of analyze without correction (Phase A markers only)",
+        help="Alias of analyze (same flags)",
     )
     _add_analyze_args(detect_p)
 
@@ -60,10 +60,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command in {"analyze", "detect"}:
-        if args.command == "detect":
-            # Force no correction / repair for detect alias unless user passed flags
-            # (flags still honored if explicitly set on detect).
-            pass
         return _cmd_analyze(args)
 
     parser.error(f"unknown command {args.command}")
@@ -108,7 +104,7 @@ def _add_analyze_args(p: argparse.ArgumentParser) -> None:
         "--repair",
         choices=["off", "conservative", "preview"],
         default="off",
-        help="Phase C: plan dropout repairs (audio apply not yet implemented)",
+        help="Phase C: apply dropout repairs to derived *.repaired.wav (conservative|preview)",
     )
     p.add_argument("--quiet", action="store_true", help="Less console output")
 
@@ -135,6 +131,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
     failures = 0
     total_events = 0
+    total_repaired = 0
     for wav_path in wavs:
         try:
             wav = read_wav(wav_path)
@@ -146,17 +143,23 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             lvl = measure_level(wav) if wav.channels == 2 else None
 
             applied: dict = {"azimuth": None, "level": None}
-            out_wav_path = None
+            corrected_path = None
+            work_wav = wav
+            repair_report = report
+
             if correct and wav.channels == 2:
-                out_wav_path = out_dir / f"{wav_path.stem}.corrected.wav"
+                corrected_path = out_dir / f"{wav_path.stem}.corrected.wav"
                 applied = apply_corrections(
                     wav,
                     azimuth=az,
                     level=lvl,
                     correct=correct,
-                    out_path=out_wav_path,
+                    out_path=corrected_path,
                     lag_override=args.lag_samples,
                 )
+                # Re-detect on corrected audio so repair sample indices match
+                work_wav = read_wav(corrected_path)
+                repair_report = analyze(work_wav, cfg)
             elif correct and wav.channels == 1:
                 print(f"warning: {wav_path}: --correct ignored for mono", file=sys.stderr)
 
@@ -169,24 +172,35 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
                 stereo_relationship=report.stereo_relationship,
                 channel_correlation=report.channel_correlation,
                 applied=applied,
-                output_wav=str(out_wav_path) if out_wav_path else None,
+                output_wav=str(corrected_path) if corrected_path else None,
             )
             align_path = out_dir / f"{wav_path.stem}.alignment.json"
             write_json_obj(align.to_dict(), align_path)
 
-            repair_info = None
+            repair_extra = ""
             if args.repair != "off":
-                plan = plan_repairs(report, mode=args.repair)
-                repair_path = out_dir / f"{wav_path.stem}.repair-plan.json"
-                write_json_obj(plan.to_dict(), repair_path)
-                repair_info = repair_path.name
+                repaired_path = out_dir / f"{wav_path.stem}.repaired.wav"
+                result = apply_repairs(
+                    work_wav,
+                    repair_report,
+                    repaired_path,
+                    mode=args.repair,
+                )
+                repair_path = out_dir / f"{wav_path.stem}.repair.json"
+                write_json_obj(result.to_dict(), repair_path)
+                # Also keep Audacity labels for repaired regions
+                _write_repaired_labels(result.provenance.get("repaired_events", []), out_dir / f"{wav_path.stem}.repaired.txt")
+                total_repaired += result.plan.repaired_count
+                repair_extra = (
+                    f", repaired={repaired_path.name} ({result.plan.repaired_count} event(s)), "
+                    f"repair_log={repair_path.name}"
+                )
 
             if not args.quiet:
                 az_s = f"lag={az.lag_samples:.2f}sa ({az.lag_microseconds:.1f}µs)" if az else "n/a"
                 lv_s = f"L−R={lvl.lr_rms_diff_db:+.2f} dB" if lvl else "n/a"
-                extra = f", corrected={out_wav_path.name}" if out_wav_path else ""
-                if repair_info:
-                    extra += f", repair_plan={repair_info}"
+                extra = f", corrected={corrected_path.name}" if corrected_path else ""
+                extra += repair_extra
                 print(
                     f"{wav_path}: {len(report.events)} dropout(s), azimuth[{az_s}], level[{lv_s}] "
                     f"-> {paths['json'].name}, {align_path.name}{extra}"
@@ -197,9 +211,18 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
     if not args.quiet:
         print(
-            f"done: {len(wavs) - failures}/{len(wavs)} file(s), {total_events} dropout event(s), out={out_dir}"
+            f"done: {len(wavs) - failures}/{len(wavs)} file(s), {total_events} dropout event(s), "
+            f"{total_repaired} repaired, out={out_dir}"
         )
     return 1 if failures else 0
+
+
+def _write_repaired_labels(events: list[dict], path: Path) -> None:
+    lines = []
+    for ev in events:
+        label = f"repaired|{ev.get('type')}|ch={ev.get('channel')}|{ev.get('strategy')}"
+        lines.append(f"{ev['start_s']:.6f}\t{ev['end_s']:.6f}\t{label}")
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def _collect_wavs(inputs: list[Path]) -> list[Path]:
