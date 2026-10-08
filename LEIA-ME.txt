@@ -1,0 +1,40 @@
+mtdrop — ferramenta local para dropouts de fita (Master Tools)
+==============================================================
+
+O codigo NAO esta no branch "main" do GitHub (la so ha um README).
+Use este ZIP (branch do PR) ou a pasta extraida dele.
+
+COMO USAR (Windows)
+-------------------
+1) Extraia TODO o conteudo deste ZIP para uma pasta
+   (ex.: Documentos\mtdrop).
+
+2) Dê duplo clique em:  INSTALAR_E_ABRIR.bat
+
+3) Na primeira vez o Windows instala as dependencias Python
+   (precisa ter Python 3.10+ instalado, com "Add to PATH").
+
+4) Quando a instalacao terminar, a interface abre.
+   No navegador, abra:
+
+      http://127.0.0.1:7860
+
+5) Carregue um WAV, marque correct/repair, clique em Run,
+   e escute original / corrigido / reparado.
+
+REQUISITOS
+----------
+- Windows 10/11
+- Python 3.10 ou superior (https://www.python.org/downloads/)
+  Marque a opcao "Add python.exe to PATH".
+
+PROBLEMAS COMUNS
+----------------
+- "Python nao encontrado": reinstale o Python marcando PATH,
+  feche e abra de novo o Explorer, e tente o .bat outra vez.
+- Porta 7860 ocupada: feche outro mtdrop/Gradio e tente de novo.
+- Antivirus bloqueando pip: permita temporariamente e repita.
+
+O arquivo WAV original NUNCA e sobrescrito.
+Saidas corrigidas/reparadas mantem a mesma taxa, bits e canais
+do arquivo de entrada (ex.: 88.2 kHz/24-bit -> 88.2/24).

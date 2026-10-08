@@ -4,7 +4,17 @@ Offline tool for **magnetic-tape audio transfers** (Ampex → Studer A80 and sim
 
 **Resolve/fix** path: multi-class dropout detection, **azimuth** + **L/R level** correction, and **dropout repair** onto derived WAVs. Source masters are **never overwritten**.
 
-## Install
+> **Note:** GitHub `main` currently has only a stub README. Use **this PR branch** (or the Windows zip `mtdrop-windows.zip`) — not a ZIP of `main`.
+
+## Windows (easiest)
+
+1. Extract the zip (or this repo folder).
+2. Double-click `INSTALAR_E_ABRIR.bat` (see also `LEIA-ME.txt`).
+3. Open **http://127.0.0.1:7860** in your browser.
+
+Requires Python 3.10+ with “Add to PATH”.
+
+## Install (macOS / Linux / manual)
 
 ```bash
 python3 -m venv .venv
