@@ -20,9 +20,9 @@ class DetectConfig:
     frame_ms: float = 5.0
     hop_ms: float = 2.5
     baseline_ms: float = 400.0
-    # Relative RMS below adaptive baseline (linear ratio). 0.30 ≈ -10.5 dB.
-    # Calibrated on Helio exemplo_1_18 (full-track→A80 two-track); was 0.35 on synth.
-    dip_ratio: float = 0.30
+    # Relative RMS below adaptive baseline (linear ratio). 0.34 ≈ -9.4 dB.
+    # Balanced after exemplo_1_18 (FP flood at 0.35 HF) and pior.wav (FN on medium dips at 0.30).
+    dip_ratio: float = 0.34
     # Absolute hard-mute floor (linear full-scale).
     mute_floor: float = 1e-4  # ≈ -80 dBFS
     # HF collapse vs local baseline (relative). Calibrated: 0.35 was far too sensitive
@@ -31,14 +31,48 @@ class DetectConfig:
     # Also require absolute HF energy collapse (not only HF/LF ratio).
     hf_abs_drop: float = 0.30
     # Minimum event length to keep (seconds).
-    min_duration_s: float = 0.005
+    min_duration_s: float = 0.004
     # Merge gaps shorter than this (seconds).
-    merge_gap_s: float = 0.010
+    merge_gap_s: float = 0.012
     # Asymmetry: other channel must stay above this fraction of its baseline.
     asym_other_keep: float = 0.7
-    severity_threshold: float = 0.25
+    severity_threshold: float = 0.22
     # Correlation floor for dual_mono_like hint (full-track mono→two-track often ~0.90–0.98).
     dual_mono_corr: float = 0.90
+
+
+SENSITIVITY_PRESETS: dict[str, dict[str, float]] = {
+    # Fewer FPs; may miss medium dips (seen on pior.wav with older 0.30 default).
+    "conservative": {
+        "dip_ratio": 0.30,
+        "hf_ratio_drop": 0.20,
+        "hf_abs_drop": 0.28,
+        "severity_threshold": 0.25,
+        "min_duration_s": 0.005,
+    },
+    # Default — compromise across exemplo_1_18 / 44.1_1_18 / pior.
+    "balanced": {
+        "dip_ratio": 0.34,
+        "hf_ratio_drop": 0.22,
+        "hf_abs_drop": 0.30,
+        "severity_threshold": 0.22,
+        "min_duration_s": 0.004,
+    },
+    # Hunt mild/partial dropouts on bad reels; expect more FPs — review markers.
+    "aggressive": {
+        "dip_ratio": 0.42,
+        "hf_ratio_drop": 0.28,
+        "hf_abs_drop": 0.40,
+        "severity_threshold": 0.35,
+        "min_duration_s": 0.005,
+    },
+}
+
+
+def config_for_sensitivity(name: str) -> DetectConfig:
+    if name not in SENSITIVITY_PRESETS:
+        raise ValueError(f"unknown sensitivity {name!r}; choose from {sorted(SENSITIVITY_PRESETS)}")
+    return DetectConfig(**SENSITIVITY_PRESETS[name])
 
 
 def analyze(wav: WavAudio, config: DetectConfig | None = None) -> AnalysisReport:

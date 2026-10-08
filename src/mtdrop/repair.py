@@ -197,6 +197,8 @@ def apply_repairs(
                 _cross_channel_borrow(x, ch_i, donor, a, b)
             elif strategy == "hf_band_reconstruct":
                 _hf_band_reconstruct(x[:, ch_i], a, b, sr)
+            elif strategy == "bilateral_context":
+                _bilateral_context_fill(x[:, ch_i], a, b)
             elif strategy == "stft_interp":
                 _stft_interp(x[:, ch_i], a, b)
             else:  # cubic_interp / mirror
@@ -300,9 +302,25 @@ def _choose_strategy(ev: DropoutEvent, report: AnalysisReport) -> str:
         return "cross_channel_borrow"
     if ev.type == "hf_loss":
         return "hf_band_reconstruct"
+    # Bilateral damage (common on full-track debris): long context fill beats short STFT.
+    if dual_mono and ev.channel in {"L", "R"} and _bilateral_damage(ev, report):
+        return "bilateral_context"
     if ev.duration_s >= 0.012:
         return "stft_interp"
     return "cubic_interp"
+
+
+def _bilateral_damage(ev: DropoutEvent, report: AnalysisReport) -> bool:
+    """True when the sibling channel also has an overlapping morphology hit."""
+    other = "R" if ev.channel == "L" else "L"
+    for e in report.events:
+        if e.channel != other:
+            continue
+        if e.type not in {"level_dip", "hard_mute", "hf_loss"}:
+            continue
+        if e.start_sample < ev.end_sample and e.end_sample > ev.start_sample:
+            return True
+    return False
 
 
 def _donor_usable(ev: DropoutEvent, report: AnalysisReport, *, dual_mono: bool) -> bool:
@@ -375,6 +393,31 @@ def _mirror_interp(ch: np.ndarray, a: int, b: int, ctx: int = 128) -> None:
         fill = fill - fill[0] + ch[a - 1]
     w_new, w_old = _fade_weights(n, max(8, min(64, n // 4)))
     ch[a:b] = w_new * fill + w_old * ch[a:b]
+
+
+def _bilateral_context_fill(ch: np.ndarray, a: int, b: int) -> None:
+    """Longer-context fill for dual-mono bilateral dropouts (both channels damaged).
+
+    Cross-channel borrow is unavailable; use extended mirror from each side of the
+    gap plus a light STFT magnitude blend so short full-track hits are less 'holey'.
+    """
+    n = b - a
+    if n <= 0:
+        return
+    ctx = max(256, min(2048, n * 4))
+    _mirror_interp(ch, a, b, ctx=ctx)
+    # Refine with STFT if gap is long enough for a stable transform
+    if n >= 64:
+        backup = ch[a:b].copy()
+        try:
+            _stft_interp(ch, a, b, n_fft=min(512, 1 << int(np.ceil(np.log2(max(64, n))))), hop=64)
+            # Blend mirror (transient continuity) with STFT (tonal fill)
+            t = np.linspace(0.0, 1.0, n)
+            # Prefer mirror at edges, STFT in the middle
+            w_stft = np.sin(np.pi * t) ** 2
+            ch[a:b] = (1.0 - w_stft) * backup + w_stft * ch[a:b]
+        except Exception:  # noqa: BLE001
+            ch[a:b] = backup
 
 
 def _tile_to(seg: np.ndarray, n: int) -> np.ndarray:

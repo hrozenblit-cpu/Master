@@ -7,7 +7,7 @@ from pathlib import Path
 
 from mtdrop import __version__
 from mtdrop.align import AlignmentReport, apply_corrections, measure_azimuth, measure_level
-from mtdrop.detect import DetectConfig, analyze
+from mtdrop.detect import DetectConfig, analyze, config_for_sensitivity
 from mtdrop.export import write_json_obj, write_report_bundle
 from mtdrop.fixture import synthesize_dropout_wav
 from mtdrop.repair import apply_repairs
@@ -79,14 +79,20 @@ def _add_analyze_args(p: argparse.ArgumentParser) -> None:
         required=True,
         help="Output directory for reports / derived WAVs (created if missing). Sources never modified.",
     )
-    p.add_argument("--min-duration-ms", type=float, default=5.0, help="Minimum dropout event length (ms)")
-    p.add_argument("--severity-threshold", type=float, default=0.25, help="Drop events below this severity")
-    p.add_argument("--dip-ratio", type=float, default=0.30, help="RMS / baseline ratio for level dips")
+    p.add_argument(
+        "--sensitivity",
+        choices=["conservative", "balanced", "aggressive"],
+        default="balanced",
+        help="Detection preset (balanced default; aggressive hunts mild dips on bad reels)",
+    )
+    p.add_argument("--min-duration-ms", type=float, default=None, help="Override minimum event length (ms)")
+    p.add_argument("--severity-threshold", type=float, default=None, help="Override severity floor")
+    p.add_argument("--dip-ratio", type=float, default=None, help="Override RMS/baseline dip ratio")
     p.add_argument(
         "--hf-ratio",
         type=float,
-        default=0.22,
-        help="HF/LF ratio collapse threshold (lower = stricter; calibrated on exemplo_1_18)",
+        default=None,
+        help="Override HF/LF ratio collapse threshold (lower = stricter)",
     )
     p.add_argument(
         "--correct",
@@ -127,12 +133,15 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         print(f"error: unknown --correct values: {sorted(unknown)}", file=sys.stderr)
         return 2
 
-    cfg = DetectConfig(
-        min_duration_s=max(0.0, args.min_duration_ms / 1000.0),
-        severity_threshold=args.severity_threshold,
-        dip_ratio=args.dip_ratio,
-        hf_ratio_drop=args.hf_ratio,
-    )
+    cfg = config_for_sensitivity(args.sensitivity)
+    if args.min_duration_ms is not None:
+        cfg.min_duration_s = max(0.0, args.min_duration_ms / 1000.0)
+    if args.severity_threshold is not None:
+        cfg.severity_threshold = args.severity_threshold
+    if args.dip_ratio is not None:
+        cfg.dip_ratio = args.dip_ratio
+    if args.hf_ratio is not None:
+        cfg.hf_ratio_drop = args.hf_ratio
     out_dir: Path = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
 

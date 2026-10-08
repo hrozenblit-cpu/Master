@@ -31,7 +31,15 @@ mtdrop analyze tests/fixtures/synth_dropouts_48k_stereo.wav --out ./reports \
 mtdrop analyze /path/to/transfers/ --out ./reports --repair conservative
 ```
 
-`preview` allows slightly longer events than `conservative`.
+`preview` allows slightly longer repair durations than `conservative`.
+
+Detection sensitivity presets:
+
+```bash
+mtdrop analyze input.wav --out ./out --sensitivity balanced   # default
+mtdrop analyze input.wav --out ./out --sensitivity conservative
+mtdrop analyze input.wav --out ./out --sensitivity aggressive  # mild dips; more FPs
+```
 
 ## Outputs (under `--out` only)
 

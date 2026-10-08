@@ -91,7 +91,7 @@ def test_correct_writes_derived_wav(tmp_path: Path) -> None:
 def test_repair_applies_and_fills_hard_mute(tmp_path: Path) -> None:
     wav_path = _ensure_fixture()
     wav = read_wav(wav_path)
-    report = analyze(wav)
+    report = analyze(wav, DetectConfig(hf_ratio_drop=0.35, dip_ratio=0.35, min_duration_s=0.003, severity_threshold=0.12))
     plan = plan_repairs(report, mode="conservative")
     assert plan.status == "planned"
     assert len(plan.events_selected) >= 1
@@ -131,6 +131,8 @@ def test_cli_analyze_correct_and_repair(tmp_path: Path) -> None:
             "azimuth,level",
             "--repair",
             "conservative",
+            "--sensitivity",
+            "aggressive",
             "--quiet",
         ]
     )
