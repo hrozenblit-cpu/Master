@@ -10,6 +10,7 @@ from mtdrop.align import AlignmentReport, apply_corrections, measure_azimuth, me
 from mtdrop.detect import DetectConfig, analyze, config_for_sensitivity
 from mtdrop.export import write_json_obj, write_report_bundle
 from mtdrop.fixture import synthesize_dropout_wav
+from mtdrop.preview import events_from_dropout_json, export_event_previews, export_padded_clip, loudnorm_mp3
 from mtdrop.repair import apply_repairs
 from mtdrop.wav_io import read_wav
 
@@ -37,6 +38,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_analyze_args(detect_p)
 
+    ui_p = sub.add_parser("ui", help="Launch local Gradio listen UI (full-file A/B)")
+    ui_p.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1)")
+    ui_p.add_argument("--port", type=int, default=7860, help="Port (default 7860)")
+    ui_p.add_argument("--share", action="store_true", help="Create Gradio public share link")
+
+    prev_p = sub.add_parser(
+        "preview",
+        help="Export listen-friendly padded clips (≥2.5 s) + optional loudnorm MP3",
+    )
+    prev_p.add_argument(
+        "--wav",
+        type=str,
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help="Labeled source, e.g. original=in.wav repaired=out.repaired.wav (repeatable)",
+    )
+    prev_p.add_argument("--events", type=Path, help="dropouts.json to pick top events from")
+    prev_p.add_argument("--center", type=float, action="append", default=[], help="Manual center time(s) in seconds")
+    prev_p.add_argument("--out", type=Path, required=True, help="Output directory for preview clips")
+    prev_p.add_argument("--stem", type=str, default="listen", help="Filename stem prefix")
+    prev_p.add_argument("--min-duration", type=float, default=2.5, help="Minimum clip length in seconds (default 2.5)")
+    prev_p.add_argument("--pad", type=float, default=1.25, help="Pad each side of event before min-duration enforce")
+    prev_p.add_argument("--max-events", type=int, default=3, help="Max events from --events JSON")
+    prev_p.add_argument("--mp3", action="store_true", default=True, help="Also write loudnorm MP3 (default on)")
+    prev_p.add_argument("--no-mp3", action="store_true", help="Skip MP3 export")
+
     fix_p = sub.add_parser("make-fixture", help="Write a synthetic WAV with injected dropouts + skew")
     fix_p.add_argument("--out", type=Path, required=True, help="Destination .wav path")
     fix_p.add_argument("--sr", type=int, default=48000, help="Sample rate (default 48000)")
@@ -58,6 +86,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(meta, indent=2))
         return 0
+
+    if args.command == "ui":
+        return _cmd_ui(args)
+
+    if args.command == "preview":
+        return _cmd_preview(args)
 
     if args.command in {"analyze", "detect"}:
         return _cmd_analyze(args)
@@ -117,6 +151,11 @@ def _add_analyze_args(p: argparse.ArgumentParser) -> None:
         choices=["off", "conservative", "preview"],
         default="off",
         help="Phase C: apply dropout repairs to derived *.repaired.wav (conservative|preview)",
+    )
+    p.add_argument(
+        "--listen-previews",
+        action="store_true",
+        help="After analyze, write ≥2.5 s padded WAV(+loudnorm MP3) clips for top dropouts under --out",
     )
     p.add_argument("--quiet", action="store_true", help="Less console output")
 
@@ -194,6 +233,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             write_json_obj(align.to_dict(), align_path)
 
             repair_extra = ""
+            repaired_path = None
             if args.repair != "off":
                 repaired_path = out_dir / f"{wav_path.stem}.repaired.wav"
                 result = apply_repairs(
@@ -212,11 +252,29 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
                     f"repair_log={repair_path.name}"
                 )
 
+            preview_extra = ""
+            if getattr(args, "listen_previews", False) and report.events:
+                sources = {"original": wav_path}
+                if corrected_path is not None:
+                    sources["corrected"] = corrected_path
+                if repaired_path is not None:
+                    sources["repaired"] = repaired_path
+                clips = export_event_previews(
+                    sources,
+                    [e.to_dict() for e in report.events if e.type != "channel_asymmetry"],
+                    out_dir,
+                    stem=wav_path.stem,
+                    min_duration_s=2.5,
+                    mp3=True,
+                )
+                write_json_obj([c.to_dict() for c in clips], out_dir / f"{wav_path.stem}.previews.json")
+                preview_extra = f", listen_previews={len(clips)}"
+
             if not args.quiet:
                 az_s = f"lag={az.lag_samples:.2f}sa ({az.lag_microseconds:.1f}µs)" if az else "n/a"
                 lv_s = f"L−R={lvl.lr_rms_diff_db:+.2f} dB" if lvl else "n/a"
                 extra = f", corrected={corrected_path.name}" if corrected_path else ""
-                extra += repair_extra
+                extra += repair_extra + preview_extra
                 print(
                     f"{wav_path}: {len(report.events)} dropout(s), azimuth[{az_s}], level[{lv_s}] "
                     f"-> {paths['json'].name}, {align_path.name}{extra}"
@@ -239,6 +297,71 @@ def _write_repaired_labels(events: list[dict], path: Path) -> None:
         label = f"repaired|{ev.get('type')}|ch={ev.get('channel')}|{ev.get('strategy')}"
         lines.append(f"{ev['start_s']:.6f}\t{ev['end_s']:.6f}\t{label}")
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def _cmd_ui(args: argparse.Namespace) -> int:
+    try:
+        from mtdrop.ui import launch
+    except ImportError as exc:
+        print(
+            "error: UI extras not installed. Run: pip install -e \".[ui]\"\n"
+            f"({exc})",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Starting mtdrop UI at http://{args.host}:{args.port}")
+    launch(host=args.host, port=args.port, share=args.share)
+    return 0
+
+
+def _cmd_preview(args: argparse.Namespace) -> int:
+    sources: dict[str, Path] = {}
+    for item in args.wav:
+        if "=" not in item:
+            print(f"error: --wav expects LABEL=PATH, got {item}", file=sys.stderr)
+            return 2
+        label, path_s = item.split("=", 1)
+        sources[label.strip()] = Path(path_s)
+
+    if not sources and not args.center:
+        # Allow bare positional-less usage only with labeled wavs
+        print("error: provide at least one --wav LABEL=PATH", file=sys.stderr)
+        return 2
+
+    # If only one unlabeled path was intended — require labels for clarity
+    events: list[dict] = []
+    if args.events:
+        events = events_from_dropout_json(args.events)
+    for c in args.center:
+        events.append({"start_s": c, "end_s": c, "severity": 1.0, "type": "manual", "channel": "both"})
+
+    if not events:
+        print("error: provide --events dropouts.json and/or --center TIME", file=sys.stderr)
+        return 2
+
+    use_mp3 = args.mp3 and not args.no_mp3
+    clips = export_event_previews(
+        sources,
+        events,
+        args.out,
+        stem=args.stem,
+        pad_s=args.pad,
+        min_duration_s=args.min_duration,
+        max_events=args.max_events,
+        mp3=use_mp3,
+    )
+    meta_path = args.out / f"{args.stem}.previews.json"
+    write_json_obj([c.to_dict() for c in clips], meta_path)
+    for c in clips:
+        dur = c.end_s - c.start_s
+        mp3_s = f" + {c.mp3_path.name}" if c.mp3_path else ""
+        print(f"{c.wav_path.name}: {dur:.2f}s ({c.start_s:.2f}-{c.end_s:.2f}){mp3_s}")
+    print(f"done: {len(clips)} clip(s), min_duration={args.min_duration}s, out={args.out}")
+    # Guardrail: refuse silently short clips
+    short = [c for c in clips if (c.end_s - c.start_s) < min(2.0, args.min_duration - 0.05)]
+    if short:
+        print(f"warning: {len(short)} clip(s) shorter than requested (file edge)", file=sys.stderr)
+    return 0
 
 
 def _collect_wavs(inputs: list[Path]) -> list[Path]:

@@ -9,10 +9,11 @@ Offline tool for **magnetic-tape audio transfers** (Ampex → Studer A80 and sim
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,ui]"
 ```
 
-Requires libsndfile (`soundfile`). Debian/Ubuntu: `sudo apt-get install -y libsndfile1`.
+Requires libsndfile (`soundfile`). Debian/Ubuntu: `sudo apt-get install -y libsndfile1`.  
+UI also needs Gradio (`[ui]` extra). Optional loudnorm MP3 previews need `ffmpeg`.
 
 ## Quick start
 
@@ -39,6 +40,30 @@ Detection sensitivity presets:
 mtdrop analyze input.wav --out ./out --sensitivity balanced   # default
 mtdrop analyze input.wav --out ./out --sensitivity conservative
 mtdrop analyze input.wav --out ./out --sensitivity aggressive  # mild dips; more FPs
+```
+
+### Local listen UI (full-file A/B)
+
+```bash
+pip install -e ".[ui]"
+mtdrop ui
+# open http://127.0.0.1:7860
+# or: mtdrop ui --host 127.0.0.1 --port 7860
+```
+
+Upload a WAV → toggle correct / repair / sensitivity → play **full** original vs corrected vs repaired in the browser → download derived WAVs + JSON. Source file is never overwritten.
+
+### Listen previews (≥2.5 s — do not ship sub-second clips)
+
+```bash
+# During analyze (top events → WAV + loudnorm MP3 under --out)
+mtdrop analyze input.wav --out ./out --repair conservative --listen-previews
+
+# Or standalone
+mtdrop preview \
+  --wav original=input.wav --wav repaired=out/input.repaired.wav \
+  --events out/input.dropouts.json \
+  --out ./out --stem input --min-duration 2.5
 ```
 
 ## Outputs (under `--out` only)
@@ -77,5 +102,6 @@ pytest -q
 |---|---|
 | A — detect + markers + azimuth/level measure | Ships |
 | B — gated `--correct` → derived WAV | Ships |
-| C — gated `--repair` → derived repaired WAV | Ships (conservative); long gaps / ML / GUI next |
-| Calibration on Helio full-track→two-track clip | First pass done; more A80 reels needed |
+| C — gated `--repair` → derived repaired WAV | Ships (conservative) |
+| Local Gradio listen UI (`mtdrop ui`) | Ships (single-file); batch-folder UI later |
+| Calibration on Helio full-track→two-track clips | First pass done; more A80 reels needed |

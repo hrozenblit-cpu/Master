@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+ui = ["gradio>=4.0"]
 
 [project.scripts]
 mtdrop = "mtdrop.cli:main"
