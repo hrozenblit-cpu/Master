@@ -301,20 +301,35 @@ def _stereo_relationship(
     dual_mono_like covers: intentional dual-mono masters AND full-track mono tape
     digitized as two-track (Studer A80), where L≈R program and differences are mostly
     azimuth, channel gain, and dropout asymmetry — not stereo imaging.
+
+    Uses the 90th percentile of short window correlations so damaged sections on a
+    longer full-track→two-track reel do not drag a dual-mono transfer into true_stereo
+    (seen on Helio 44.1_1_18: early windows ~0.94, later damage pulls the mean down).
     """
     n = min(left.size, right.size)
     if n < 8:
         return "unknown", 0.0
-    # Downsample for speed on long files
-    step = max(1, n // 200_000)
-    a = left[:n:step].astype(np.float64)
-    b = right[:n:step].astype(np.float64)
-    a = a - a.mean()
-    b = b - b.mean()
-    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-    if denom < 1e-12:
+
+    # Adaptive window: aim for ~8–24 windows across the file.
+    win = max(2048, n // 12)
+    hop = max(1024, win // 2)
+    corrs: list[float] = []
+    for start in range(0, max(1, n - win + 1), hop):
+        a = left[start : start + win].astype(np.float64)
+        b = right[start : start + win].astype(np.float64)
+        # Skip near-silent windows
+        if float(np.sqrt(np.mean(a * a))) < 1e-5 or float(np.sqrt(np.mean(b * b))) < 1e-5:
+            continue
+        a = a - a.mean()
+        b = b - b.mean()
+        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+        if denom < 1e-12:
+            continue
+        corrs.append(float(np.dot(a, b) / denom))
+
+    if not corrs:
         return "unknown", 0.0
-    corr = float(np.dot(a, b) / denom)
+    corr = float(np.quantile(corrs, 0.90))
     if corr >= dual_mono_corr:
         return "dual_mono_like", corr
     return "true_stereo", corr
