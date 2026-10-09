@@ -317,8 +317,6 @@ def apply_repairs(
         for ev in span["events"]:
             absorbed_impulse.add((ev.start_sample, ev.channel))
         a, b = span["a"], span["b"]
-        # Widen core to cover nearby residual peaks (density may have dropped a twin tick).
-        a, b = _expand_impulse_core(x, a, b, sr, radius_s=0.020)
         ch_set = []
         if dual_mono and x.shape[1] >= 2:
             ch_set = [0, 1]
@@ -339,7 +337,7 @@ def apply_repairs(
                     "channel": "L+R" if len(ch_set) > 1 else ("L" if ch_set[0] == 0 else "R"),
                     "type": "impulse_click",
                     "strategy": "declick_interp",
-                    "note": f"ola coalesce n={len(span['events'])}",
+                    "note": f"per-peak declick n={len(span['events'])}",
                 }
             )
             for ev in span["events"]:
@@ -870,7 +868,20 @@ def _throttle_impulses(
             kept_clicks.extend(group)
         for group in mild_groups[: max(0, per_slot)]:
             kept_clicks.extend(group)
+
+    # Revive twin ticks within 20 ms of a kept impulse (Samba ~24.429 + ~24.445).
+    # Density may drop the milder twin; keep it so tight per-peak declick can hit both.
     keep_click_ids = {(e.start_sample, e.channel, e.type) for e in kept_clicks}
+    kept_times = [e.start_s for e in kept_clicks]
+    for ev in clicks:
+        key = (ev.start_sample, ev.channel, ev.type)
+        if key in keep_click_ids:
+            continue
+        if any(abs(ev.start_s - t) <= 0.020 for t in kept_times):
+            kept_clicks.append(ev)
+            keep_click_ids.add(key)
+            kept_times.append(ev.start_s)
+
     if len(keep_click_ids) >= len(clicks):
         return selected, strategies, 0
 
@@ -886,56 +897,127 @@ def _throttle_impulses(
             s["strategy"] = "skip_impulse_density"
             s["reason"] = f"impulse density cap ~{_MAX_IMPULSE_PER_S[mode]:.1f}/s (time-stratified)"
             deferred += 1
+        elif s.get("strategy") == "skip_impulse_density":
+            # revived after an earlier mark — shouldn't happen in one pass
+            pass
+        else:
+            # Ensure revived twins are planned
+            if s.get("status") == "deferred" and key in keep_click_ids:
+                s["status"] = "planned"
+                s["strategy"] = "declick_interp"
+                s["reason"] = "revived twin impulse"
+                deferred = max(0, deferred - 1)
     return new_selected, strategies, deferred
 
 
 def _declick_interp(ch: np.ndarray, a: int, b: int, sr: int, *, max_new: float = 0.9) -> None:
-    """Remove a short tick via overlap-add Hermite fill with long equal-power wings.
+    """Surgical per-peak declick inside [a,b) — preserve music between ticks.
 
-    Previous ~0.2 ms edge fades caused audible ticks/swish at every join (Helio).
-    Expand outside [a,b) by ~3 ms/side, fully replace the core, and equal-power
-    crossfade only in the wings — one OLA, no post-seal.
+    Earlier OLA bridged the whole coalesced span (~20 ms) with a near-flat Hermite,
+    ducking energy ~50% (Helio still heard ~0:25 as unfixed). Now: find high-crest
+    residual peaks and replace only ~1.2 ms around each, with ~2 ms equal-power wings.
     """
-    n_core = b - a
-    if n_core <= 0:
+    if b <= a or ch.size < 8:
         return
-    # ~3 ms wings (clamped so tiny cores still get usable fades)
-    wing = max(32, int(round(sr * 0.003)))
-    a0 = max(0, a - wing)
-    b0 = min(ch.size, b + wing)
-    fade_l = a - a0
-    fade_r = b0 - b
-    n = b0 - a0
-    if n <= 0:
+    a = max(0, min(int(a), ch.size))
+    b = max(a, min(int(b), ch.size))
+    seg = ch[a:b].astype(np.float64, copy=False)
+    if seg.size < 3:
         return
+    err = np.abs(seg - 0.5 * (np.roll(seg, 1) + np.roll(seg, -1)))
+    err[0] = 0.0
+    err[-1] = 0.0
+    med = float(np.median(err))
+    mad = float(np.median(np.abs(err - med))) + 1e-12
+    thr = max(0.005, 5.5 * mad)
+    peaks = np.where(err >= thr)[0]
+    if peaks.size == 0:
+        # still hit the worst sample if clearly impulsive vs neighbors
+        i = int(np.argmax(err))
+        if err[i] < max(0.004, 4.0 * mad):
+            return
+        peaks = np.array([i])
 
-    # Hermite bridge across the whole OLA window using outer neighbors
-    left = float(ch[a0 - 1]) if a0 > 0 else float(ch[a0])
-    right = float(ch[b0]) if b0 < ch.size else float(ch[b0 - 1])
-    left_slope = float(ch[a0 - 1] - ch[a0 - 2]) if a0 >= 2 else 0.0
-    right_slope = float(ch[b0 + 1] - ch[b0]) if b0 + 1 < ch.size else 0.0
-    t = np.linspace(0.0, 1.0, n)
-    t2 = t * t
-    t3 = t2 * t
-    h00 = 2 * t3 - 3 * t2 + 1
-    h10 = t3 - 2 * t2 + t
-    h01 = -2 * t3 + 3 * t2
-    h11 = t3 - t2
-    fill = h00 * left + h10 * left_slope + h01 * right + h11 * right_slope
-    fill = _match_endpoints(fill, left, right)
+    # Crest gate: |sample| / local RMS — reject bright music texture
+    half_ctx = max(8, int(round(0.0015 * sr)))
+    candidates: list[int] = []
+    order = peaks[np.argsort(-err[peaks])]
+    for i in order:
+        abs_i = a + int(i)
+        lo = max(0, abs_i - half_ctx)
+        hi = min(ch.size, abs_i + half_ctx)
+        local = ch[lo:hi]
+        rms = float(np.sqrt(np.mean(local**2)) + 1e-12)
+        crest = float(abs(ch[abs_i]) / rms)
+        # Samba ticks ~1.4–1.6 crest on mid; allow slightly lower after azimuth
+        if crest < 1.15 and err[i] < 0.007:
+            continue
+        candidates.append(int(i))
+    if not candidates:
+        candidates = [int(np.argmax(err))]
 
-    # Plateau weight: 0 at outer edges → 1 across impulse core → 0
-    w = np.ones(n, dtype=np.float64)
-    if fade_l > 0:
-        tl = np.linspace(0.0, 1.0, fade_l, endpoint=True)
-        w[:fade_l] = np.sin(0.5 * np.pi * tl) ** 2
-    if fade_r > 0:
-        tr = np.linspace(0.0, 1.0, fade_r, endpoint=True)
-        w[-fade_r:] = np.cos(0.5 * np.pi * tr) ** 2
+    # Cluster peaks within ~2.5 ms of each seed (click bursts), one core per cluster.
+    # Prior min_sep=4 ms skipped Samba's 24.429/24.430 neighbors and left the tick.
+    cluster_r = max(4, int(round(0.0025 * sr)))
+    used = np.zeros(len(candidates), dtype=bool)
+    clusters: list[tuple[int, int]] = []  # (ca, cb) absolute
+    for idx, i_rel in enumerate(candidates):
+        if used[idx]:
+            continue
+        # primary cluster: tight burst around this peak
+        members = [i_rel]
+        used[idx] = True
+        for jdx in range(idx + 1, len(candidates)):
+            if used[jdx]:
+                continue
+            if abs(candidates[jdx] - i_rel) <= cluster_r:
+                members.append(candidates[jdx])
+                used[jdx] = True
+        pad = max(3, int(round(0.0005 * sr)))
+        ca = max(0, a + min(members) - pad)
+        cb = min(ch.size, a + max(members) + pad + 1)
+        clusters.append((ca, cb))
+        if len(clusters) >= 4:
+            break
+
+    wing = max(20, int(round(0.0022 * sr)))  # ~2.2 ms OLA wings
     strength = float(np.clip(max_new, 0.5, 1.0))
-    w = w * strength
-    orig = ch[a0:b0].astype(np.float64, copy=False)
-    ch[a0:b0] = w * fill + (1.0 - w) * orig
+
+    for ca, cb in clusters:
+        a0 = max(0, ca - wing)
+        b0 = min(ch.size, cb + wing)
+        n = b0 - a0
+        if n < 4 or cb <= ca:
+            continue
+        left = float(ch[ca - 1]) if ca > 0 else float(ch[ca])
+        right = float(ch[cb]) if cb < ch.size else float(ch[cb - 1])
+        left_slope = float(ch[ca - 1] - ch[ca - 2]) if ca >= 2 else 0.0
+        right_slope = float(ch[cb + 1] - ch[cb]) if cb + 1 < ch.size else 0.0
+        t_core = np.linspace(0.0, 1.0, max(1, cb - ca))
+        t2 = t_core * t_core
+        t3 = t2 * t_core
+        h00 = 2 * t3 - 3 * t2 + 1
+        h10 = t3 - 2 * t2 + t_core
+        h01 = -2 * t3 + 3 * t2
+        h11 = t3 - t2
+        core_fill = h00 * left + h10 * left_slope + h01 * right + h11 * right_slope
+        core_fill = _match_endpoints(core_fill, left, right)
+
+        fill = ch[a0:b0].astype(np.float64, copy=True)
+        fill[ca - a0 : cb - a0] = core_fill
+        w = np.zeros(n, dtype=np.float64)
+        fade_l = ca - a0
+        fade_r = b0 - cb
+        if fade_l > 0:
+            tl = np.linspace(0.0, 1.0, fade_l, endpoint=True)
+            w[:fade_l] = np.sin(0.5 * np.pi * tl) ** 2
+        w[ca - a0 : cb - a0] = 1.0
+        if fade_r > 0:
+            tr = np.linspace(0.0, 1.0, fade_r, endpoint=True)
+            w[cb - a0 :] = np.cos(0.5 * np.pi * tr) ** 2
+        w = w * strength
+        orig = ch[a0:b0].astype(np.float64, copy=False)
+        ch[a0:b0] = w * fill + (1.0 - w) * orig
 
 
 def _fade_len(n: int, sr: int, ms: float = 12.0) -> int:
