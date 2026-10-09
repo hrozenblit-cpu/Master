@@ -56,6 +56,27 @@ class DetectConfig:
     impulse_severity_threshold: float = 0.45
     # Hard cap per file (time-stratified keep) — avoids over-splicing bright music.
     impulse_max_events: int = 220
+    # Bilateral low-mid "tok"/thump (soft knock) — not a sharp HF tick.
+    # Calibrated on Helio Samba ``15022_02_QG_do_Samba_OK.wav`` ~24.438 s (survived spike declick).
+    detect_bilateral_toks: bool = True
+    tok_lo_hz: float = 120.0
+    tok_hi_hz: float = 2600.0
+    # Mid-band envelope jump vs ±40 ms context (excluding ±8 ms).
+    tok_min_jump: float = 2.80
+    # min(L_jump, R_jump) — both channels must knock.
+    tok_min_bilat: float = 2.65
+    tok_min_env: float = 0.016
+    tok_nms_s: float = 0.025
+    tok_min_w50_s: float = 0.0020
+    tok_max_w50_s: float = 0.012
+    tok_min_lr_corr: float = 0.90
+    # Mid-band jump should exceed HF jump (tok/thump ≠ bright tick / consonant).
+    tok_min_mid_hf_ratio: float = 1.35
+    # Half-pad around env peak for event span (seconds); repair widens modestly.
+    tok_pad_s: float = 0.0035
+    tok_severity_threshold: float = 0.50
+    # Count is L+R pairs×2; keep headroom so late Samba ~0:25 isn't starved.
+    tok_max_events: int = 120
 
 
 SENSITIVITY_PRESETS: dict[str, dict[str, float]] = {
@@ -165,13 +186,20 @@ def analyze(wav: WavAudio, config: DetectConfig | None = None) -> AnalysisReport
 
     if cfg.detect_impulse_clicks:
         events.extend(_detect_impulse_clicks(x, sr, cfg))
+    if cfg.detect_bilateral_toks and n_ch >= 2:
+        events.extend(_detect_bilateral_toks(x, sr, cfg))
 
     kept: list[DropoutEvent] = []
     impulses: list[DropoutEvent] = []
+    toks: list[DropoutEvent] = []
     for e in events:
         if e.type == "impulse_click":
             if e.severity >= cfg.impulse_severity_threshold:
                 impulses.append(e)
+            continue
+        if e.type == "bilateral_tok":
+            if e.severity >= cfg.tok_severity_threshold:
+                toks.append(e)
             continue
         if e.severity >= cfg.severity_threshold and e.duration_s >= cfg.min_duration_s:
             kept.append(e)
@@ -217,7 +245,40 @@ def analyze(wav: WavAudio, config: DetectConfig | None = None) -> AnalysisReport
                 keep.append(e)
             chosen = keep[: cfg.impulse_max_events]
         impulses = chosen[: cfg.impulse_max_events]
-    events = kept + impulses
+    if len(toks) > cfg.tok_max_events:
+        # Group L+R twins by start_sample; rank groups by severity; fair across time.
+        # Truncating a flat time-ordered list starved Samba ~0:25 after early music toks.
+        by_start: dict[int, list[DropoutEvent]] = {}
+        for e in toks:
+            by_start.setdefault(e.start_sample, []).append(e)
+        groups = sorted(by_start.values(), key=lambda g: -max(e.severity for e in g))
+        always_sev = 0.55
+        strong_g = [g for g in groups if max(e.severity for e in g) >= always_sev]
+        mild_g = [g for g in groups if max(e.severity for e in g) < always_sev]
+        # Time-stratify mild groups (1.5 s slots); always keep strong groups.
+        slot_s = 1.5
+        slots: dict[int, list[list[DropoutEvent]]] = {}
+        for g in mild_g:
+            slots.setdefault(int(g[0].start_s // slot_s), []).append(g)
+        chosen_g = list(strong_g)
+        per_slot = 2
+        for _s, gs in sorted(slots.items()):
+            gs.sort(key=lambda g: -max(e.severity for e in g))
+            chosen_g.extend(gs[:per_slot])
+        # If still over budget, drop mildest strong first but keep ≥1 group per occupied 1.5 s of strong.
+        flat = [e for g in chosen_g for e in g]
+        if len(flat) > cfg.tok_max_events:
+            # Keep strongest groups until cap (pairs stay together).
+            chosen_g.sort(key=lambda g: -max(e.severity for e in g))
+            tok_kept: list[DropoutEvent] = []
+            for g in chosen_g:
+                if len(tok_kept) + len(g) > cfg.tok_max_events:
+                    break
+                tok_kept.extend(g)
+            toks = tok_kept
+        else:
+            toks = flat
+    events = kept + impulses + toks
     events.sort(key=lambda e: (e.start_sample, e.channel, e.type))
 
     return AnalysisReport(
@@ -293,6 +354,173 @@ def _resample_frames(x: np.ndarray, target: int) -> np.ndarray:
     xp = np.linspace(0.0, 1.0, x.size)
     fp = np.linspace(0.0, 1.0, target)
     return np.interp(fp, xp, x)
+
+
+def _bandpass_fft(sig: np.ndarray, sr: int, lo: float, hi: float) -> np.ndarray:
+    """Zero-phase FFT bandpass (numpy only; no scipy dep). Reflect-pad to ease edges."""
+    n = int(sig.size)
+    if n < 16:
+        return sig.astype(np.float64, copy=True)
+    pad = min(max(8, n // 8), max(8, sr // 2))
+    # reflect without duplicating endpoints
+    left = sig[1 : pad + 1][::-1] if pad < n else sig[::-1]
+    right = sig[-(pad + 1) : -1][::-1] if pad < n else sig[::-1]
+    if left.size < pad:
+        left = np.pad(left, (pad - left.size, 0), mode="edge")
+    if right.size < pad:
+        right = np.pad(right, (0, pad - right.size), mode="edge")
+    xp = np.concatenate([left[:pad], sig, right[:pad]]).astype(np.float64, copy=False)
+    spec = np.fft.rfft(xp)
+    freqs = np.fft.rfftfreq(xp.size, d=1.0 / sr)
+    tw = 40.0
+    w = np.zeros_like(freqs)
+    mid = (freqs >= (lo + tw)) & (freqs <= (hi - tw))
+    w[mid] = 1.0
+    lo_ramp = (freqs > (lo - tw)) & (freqs < (lo + tw))
+    hi_ramp = (freqs > (hi - tw)) & (freqs < (hi + tw))
+    if np.any(lo_ramp):
+        w[lo_ramp] = 0.5 * (1.0 - np.cos(np.pi * (freqs[lo_ramp] - (lo - tw)) / (2.0 * tw)))
+    if np.any(hi_ramp):
+        w[hi_ramp] = 0.5 * (1.0 + np.cos(np.pi * (freqs[hi_ramp] - (hi - tw)) / (2.0 * tw)))
+    y = np.fft.irfft(spec * w, n=xp.size)
+    return y[pad : pad + n]
+
+
+def _smooth_abs_env(sig: np.ndarray, sr: int, win_ms: float = 1.5) -> np.ndarray:
+    w = max(3, int(round(win_ms * 0.001 * sr)))
+    if w % 2 == 0:
+        w += 1
+    kernel = np.ones(w, dtype=np.float64) / float(w)
+    return np.convolve(np.abs(sig), kernel, mode="same")
+
+
+def _detect_bilateral_toks(x: np.ndarray, sr: int, cfg: DetectConfig) -> list[DropoutEvent]:
+    """Find short bilateral low-mid knocks ("tok"/thump), not sharp HF ticks.
+
+    Samba ~0:25 survived impulse residual declick: ~4–7 ms body, centroid ~2 kHz,
+    L≈R, band-env jump ≫ local median. Repair uses a modestly wider Hermite bridge.
+    """
+    if x.ndim != 2 or x.shape[1] < 2 or x.shape[0] < int(0.1 * sr):
+        return []
+
+    mid = 0.5 * (x[:, 0] + x[:, 1])
+    bp_m = _bandpass_fft(mid, sr, cfg.tok_lo_hz, cfg.tok_hi_hz)
+    bp_l = _bandpass_fft(x[:, 0], sr, cfg.tok_lo_hz, cfg.tok_hi_hz)
+    bp_r = _bandpass_fft(x[:, 1], sr, cfg.tok_lo_hz, cfg.tok_hi_hz)
+    env_m = _smooth_abs_env(bp_m, sr)
+    env_l = _smooth_abs_env(bp_l, sr)
+    env_r = _smooth_abs_env(bp_r, sr)
+    hf_lo = min(4000.0, sr * 0.45)
+    hf_hi = min(12000.0, sr * 0.49)
+    env_hf = (
+        _smooth_abs_env(_bandpass_fft(mid, sr, hf_lo, hf_hi), sr)
+        if cfg.tok_min_mid_hf_ratio > 0 and hf_hi > hf_lo + 100
+        else None
+    )
+
+    half = max(32, int(round(0.040 * sr)))
+    excl = max(8, int(round(0.008 * sr)))
+    hop = max(1, int(round(0.0005 * sr)))
+    refine_r = max(hop, int(round(0.0015 * sr)))
+    n = int(env_m.size)
+    cands: list[tuple[float, int, float, float, float]] = []
+    for i0 in range(half, n - half, hop):
+        if env_m[i0] < cfg.tok_min_env * 0.85:
+            continue
+        # Refine to local envelope peak — hop grid alone misses Samba ~24.587.
+        lo = max(half, i0 - refine_r)
+        hi = min(n - half, i0 + refine_r + 1)
+        i = lo + int(np.argmax(env_m[lo:hi]))
+        if env_m[i] < cfg.tok_min_env:
+            continue
+        ctx = np.concatenate([env_m[i - half : i - excl], env_m[i + excl : i + half]])
+        ctx_l = np.concatenate([env_l[i - half : i - excl], env_l[i + excl : i + half]])
+        ctx_r = np.concatenate([env_r[i - half : i - excl], env_r[i + excl : i + half]])
+        if ctx.size < 8:
+            continue
+        jump = float(env_m[i] / (float(np.median(ctx)) + 1e-12))
+        if jump < cfg.tok_min_jump:
+            continue
+        jl = float(env_l[i] / (float(np.median(ctx_l)) + 1e-12))
+        jr = float(env_r[i] / (float(np.median(ctx_r)) + 1e-12))
+        bilat = min(jl, jr)
+        if bilat < cfg.tok_min_bilat:
+            continue
+        if env_hf is not None:
+            ctx_hf = np.concatenate([env_hf[i - half : i - excl], env_hf[i + excl : i + half]])
+            hf_jump = float(env_hf[i] / (float(np.median(ctx_hf)) + 1e-12))
+            if jump / (hf_jump + 1e-12) < cfg.tok_min_mid_hf_ratio:
+                continue
+        # w50 of mid envelope peak
+        thr = 0.5 * float(env_m[i])
+        left_i = i
+        right_i = i
+        lim = int(round(0.012 * sr))
+        while left_i > i - lim and env_m[left_i] > thr:
+            left_i -= 1
+        while right_i < i + lim and env_m[right_i] > thr:
+            right_i += 1
+        w50 = (right_i - left_i) / float(sr)
+        if w50 < cfg.tok_min_w50_s or w50 > cfg.tok_max_w50_s:
+            continue
+        w = max(8, int(round(0.006 * sr)))
+        a = max(0, i - w)
+        b = min(n, i + w)
+        seg_l = x[a:b, 0].astype(np.float64, copy=False)
+        seg_r = x[a:b, 1].astype(np.float64, copy=False)
+        if seg_l.size < 8:
+            continue
+        seg_l = seg_l - float(np.mean(seg_l))
+        seg_r = seg_r - float(np.mean(seg_r))
+        denom = float(np.linalg.norm(seg_l) * np.linalg.norm(seg_r)) + 1e-12
+        corr = float(np.dot(seg_l, seg_r) / denom)
+        if corr < cfg.tok_min_lr_corr:
+            continue
+        score = jump * bilat * float(env_m[i])
+        cands.append((score, i, jump, bilat, w50))
+
+    if not cands:
+        return []
+    cands.sort(key=lambda t: -t[0])
+    nms = max(hop, int(round(cfg.tok_nms_s * sr)))
+    chosen: list[tuple[float, int, float, float, float]] = []
+    for row in cands:
+        if any(abs(row[1] - c[1]) < nms for c in chosen):
+            continue
+        chosen.append(row)
+        if len(chosen) >= 200:
+            break
+    chosen.sort(key=lambda t: t[1])
+
+    out: list[DropoutEvent] = []
+    pad = max(4, int(round(cfg.tok_pad_s * sr)))
+    for _score, i, jump, bilat, w50 in chosen:
+        # Span covers tok body (+ pad); repair uses modest Hermite over this window.
+        half_body = max(pad, int(round(0.5 * w50 * sr)) + int(round(0.001 * sr)))
+        a = max(0, i - half_body)
+        b = min(n, i + half_body + 1)
+        sev = float(np.clip((jump - 1.0) / 3.5, 0.0, 1.0))
+        conf = float(np.clip(0.55 + 0.35 * sev + 0.05 * min(bilat, 4.0), 0.0, 0.99))
+        note = (
+            f"bilateral tok/thump (low-mid); jump={jump:.2f} bilat={bilat:.2f} "
+            f"w50={w50*1000:.1f}ms; not a sharp HF tick"
+        )
+        for tag in ("L", "R"):
+            out.append(
+                DropoutEvent(
+                    start_s=a / sr,
+                    end_s=b / sr,
+                    start_sample=a,
+                    end_sample=b,
+                    channel=tag,  # type: ignore[arg-type]
+                    type="bilateral_tok",
+                    severity=sev,
+                    confidence=conf,
+                    duration_class=duration_class((b - a) / sr),
+                    notes=note,
+                )
+            )
+    return out
 
 
 def _detect_impulse_clicks(x: np.ndarray, sr: int, cfg: DetectConfig) -> list[DropoutEvent]:

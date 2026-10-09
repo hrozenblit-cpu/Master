@@ -37,8 +37,21 @@ def _norm_mode(mode: RepairMode) -> RepairMode:
 # borrow from the clean sibling — see _choose_strategy.
 _MAX_DUR = {
     # impulse_click cap allows coalesced neighboring ticks into one OLA span
-    "conservative": {"hard_mute": 0.080, "level_dip": 0.055, "hf_loss": 0.035, "impulse_click": 0.022},
-    "aggressive": {"hard_mute": 0.20, "level_dip": 0.25, "hf_loss": 0.30, "impulse_click": 0.030},
+    # bilateral_tok ~4–8 ms body + pad; keep well under vocal-chew widths
+    "conservative": {
+        "hard_mute": 0.080,
+        "level_dip": 0.055,
+        "hf_loss": 0.035,
+        "impulse_click": 0.022,
+        "bilateral_tok": 0.014,
+    },
+    "aggressive": {
+        "hard_mute": 0.20,
+        "level_dip": 0.25,
+        "hf_loss": 0.30,
+        "impulse_click": 0.030,
+        "bilateral_tok": 0.016,
+    },
 }
 _MAX_DUR_BORROW = {
     "conservative": {"hard_mute": 0.15, "level_dip": 0.12, "hf_loss": 0.12},
@@ -49,14 +62,41 @@ _MAX_DUR_BORROW = {
 _MIN_SEVERITY = {
     # level_dip 0.72 keeps pior.wav real holes; apply-time content gate blocks voiced FPs
     # impulse_click 0.58 keeps Samba ~0:25 (sev≈0.66–0.73 after azimuth) while cutting mild FPs
-    "conservative": {"hard_mute": 0.55, "level_dip": 0.72, "hf_loss": 0.92, "impulse_click": 0.58},
-    "aggressive": {"hard_mute": 0.40, "level_dip": 0.60, "hf_loss": 0.82, "impulse_click": 0.48},
+    # bilateral_tok: high floor — only clear knocks (Samba ~24.438 sev≈1.0).
+    # Milder mid onsets in vocals are left alone (Helio: don't chew words).
+    "conservative": {
+        "hard_mute": 0.55,
+        "level_dip": 0.72,
+        "hf_loss": 0.92,
+        "impulse_click": 0.58,
+        "bilateral_tok": 0.80,
+    },
+    "aggressive": {
+        "hard_mute": 0.40,
+        "level_dip": 0.60,
+        "hf_loss": 0.82,
+        "impulse_click": 0.48,
+        # 0.70 ≈ jump≳3.45 — Samba primary; secondary ~24.59 (sev≈0.58) stays marker-only
+        "bilateral_tok": 0.70,
+    },
 }
 # Skip micro repairs that only create edge clicks (seconds).
 # impulse_click is intentionally sub-ms…few-ms — do not treat as skip_micro.
 _MIN_APPLY_DUR = {
-    "conservative": {"hard_mute": 0.003, "level_dip": 0.008, "hf_loss": 0.025, "impulse_click": 0.00015},
-    "aggressive": {"hard_mute": 0.003, "level_dip": 0.005, "hf_loss": 0.015, "impulse_click": 0.0001},
+    "conservative": {
+        "hard_mute": 0.003,
+        "level_dip": 0.008,
+        "hf_loss": 0.025,
+        "impulse_click": 0.00015,
+        "bilateral_tok": 0.002,
+    },
+    "aggressive": {
+        "hard_mute": 0.003,
+        "level_dip": 0.005,
+        "hf_loss": 0.015,
+        "impulse_click": 0.0001,
+        "bilateral_tok": 0.002,
+    },
 }
 # Merge same-channel planned spans closer than this (seconds).
 _MERGE_GAP_S = {"conservative": 0.040, "aggressive": 0.020}
@@ -66,6 +106,10 @@ _MAX_SPANS_PER_S = {"conservative": 0.6, "aggressive": 2.0}
 _MAX_IMPULSE_PER_S = {"conservative": 0.45, "aggressive": 1.5}
 # Coalesce nearby impulse peaks into one OLA span (seconds).
 _IMPULSE_COALESCE_S = {"conservative": 0.018, "aggressive": 0.012}
+# Coalesce nearby bilateral toks into one modest Hermite span (seconds).
+_TOK_COALESCE_S = {"conservative": 0.016, "aggressive": 0.014}
+# Tok Hermite blend strength (partial — preserves underlying RMS; full=1 ducks/mush).
+_TOK_STRENGTH = {"conservative": 0.62, "aggressive": 0.72}
 # Max fraction of fill vs original for non-mute strategies (vocal safety).
 _MAX_NEW_BLEND = {"conservative": 0.45, "aggressive": 0.95}
 
@@ -138,11 +182,11 @@ def plan_repairs(
     strategies: list[dict[str, Any]] = []
     deferred = 0
 
-    # Per-channel morphology + source impulse clicks (ticks/pops in the transfer).
+    # Per-channel morphology + source impulse clicks + bilateral toks (ticks/pops/toks).
     candidates = [
         e
         for e in report.events
-        if e.type in {"level_dip", "hard_mute", "hf_loss", "impulse_click"}
+        if e.type in {"level_dip", "hard_mute", "hf_loss", "impulse_click", "bilateral_tok"}
         and e.channel in {"L", "R", "mono"}
     ]
     # Strongest / longest first so weak dense HF hits yield to real dropouts.
@@ -166,9 +210,14 @@ def plan_repairs(
             deferred += 1
             continue
 
-        # Impulses: allow close neighbors into the plan — apply coalesces them into one OLA.
+        # Impulses/toks: allow close neighbors into the plan — apply coalesces them.
         # Dropouts still use the wider merge gap so dense HF doesn't stack splices.
-        gap = 0.001 if ev.type == "impulse_click" else merge_gap
+        if ev.type == "impulse_click":
+            gap = 0.001
+        elif ev.type == "bilateral_tok":
+            gap = 0.002
+        else:
+            gap = merge_gap
         if _overlaps_claimed(ev, claimed, merge_gap_s=gap, sr=report.sample_rate):
             strategies.append(
                 _strat(ev, "skip_overlap", "deferred", reason="overlaps / within merge gap of stronger event")
@@ -265,6 +314,8 @@ def plan_repairs(
     deferred += extra_def
     selected, strategies, extra_imp = _throttle_impulses(selected, strategies, dur_s, mode=mode)
     deferred += extra_imp
+    selected, strategies, extra_tok = _throttle_toks(selected, strategies, dur_s, mode=mode)
+    deferred += extra_tok
 
     return RepairPlan(
         mode=mode,
@@ -355,13 +406,68 @@ def apply_repairs(
                     meta["status"] = "failed"
                     meta["reason"] = str(exc)
 
+    # Bilateral toks: modestly wider Hermite over tok body (not residual-peak hunting).
+    tok_spans = _coalesce_impulse_spans(
+        [e for e in order if e.type == "bilateral_tok"],
+        gap_s=_TOK_COALESCE_S[mode],
+        sr=sr,
+        n_frames=x.shape[0],
+    )
+    absorbed_tok: set[tuple[int, str]] = set()
+    tok_strength = _TOK_STRENGTH[mode]
+    for span in tok_spans:
+        for ev in span["events"]:
+            absorbed_tok.add((ev.start_sample, ev.channel))
+        a, b = span["a"], span["b"]
+        # Clamp span to modest tok width so coalesced neighbors don't chew vocals.
+        max_tok = int(round(_MAX_DUR[mode]["bilateral_tok"] * sr))
+        if b - a > max_tok:
+            mid = (a + b) // 2
+            a = max(0, mid - max_tok // 2)
+            b = min(x.shape[0], a + max_tok)
+        ch_set = [0, 1] if x.shape[1] >= 2 else [0]
+        try:
+            for ci in ch_set:
+                _declick_tok(x[:, ci], a, b, sr, strength=tok_strength)
+            applied.append(
+                {
+                    "start_s": a / sr,
+                    "end_s": b / sr,
+                    "start_sample": a,
+                    "end_sample": b,
+                    "channel": "L+R" if len(ch_set) > 1 else "mono",
+                    "type": "bilateral_tok",
+                    "strategy": "declick_tok",
+                    "note": f"tok/thump Hermite n={len(span['events'])} strength={tok_strength:.2f}",
+                }
+            )
+            for ev in span["events"]:
+                key = (ev.start_sample, ev.channel, ev.type)
+                meta = strat_by_key.get(key)
+                if meta is not None:
+                    meta["status"] = "applied"
+                    meta["strategy"] = "declick_tok"
+                    meta["note"] = "tok coalesce"
+        except Exception as exc:  # noqa: BLE001
+            for ev in span["events"]:
+                key = (ev.start_sample, ev.channel, ev.type)
+                meta = strat_by_key.get(key)
+                if meta is not None:
+                    meta["status"] = "failed"
+                    meta["reason"] = str(exc)
+
     for ev in order:
         key = (ev.start_sample, ev.channel, ev.type)
         meta = strat_by_key.get(key) or _strat(ev, _choose_strategy(ev, report, mode=mode), "planned")
-        if ev.type == "impulse_click" or (ev.start_sample, ev.channel) in absorbed_impulse:
+        if (
+            ev.type == "impulse_click"
+            or ev.type == "bilateral_tok"
+            or (ev.start_sample, ev.channel) in absorbed_impulse
+            or (ev.start_sample, ev.channel) in absorbed_tok
+        ):
             if meta.get("status") == "planned":
                 meta["status"] = "applied"
-                meta["note"] = "ola coalesce"
+                meta["note"] = "ola coalesce" if ev.type == "impulse_click" else "tok coalesce"
             continue
         strategy = meta["strategy"]
         ch_i = _channel_index(ev.channel, x.shape[1])
@@ -382,7 +488,7 @@ def apply_repairs(
         if (
             dual_mono
             and ev.type in {"level_dip", "hf_loss", "hard_mute"}
-            and strategy not in {"cross_channel_borrow", "declick_interp"}
+            and strategy not in {"cross_channel_borrow", "declick_interp", "declick_tok"}
             and ev.channel in {"L", "R"}
         ):
             meta["status"] = "deferred"
@@ -538,11 +644,11 @@ def _throttle_density(
     *,
     mode: RepairMode,
 ) -> tuple[list[DropoutEvent], list[dict[str, Any]], int]:
-    """Keep at most N unique dropout time-spans per second (impulse clicks exempt)."""
+    """Keep at most N unique dropout time-spans per second (impulse/tok clicks exempt)."""
     if not selected or duration_s <= 0:
         return selected, strategies, 0
-    clicks = [e for e in selected if e.type == "impulse_click"]
-    drops = [e for e in selected if e.type != "impulse_click"]
+    clicks = [e for e in selected if e.type in {"impulse_click", "bilateral_tok"}]
+    drops = [e for e in selected if e.type not in {"impulse_click", "bilateral_tok"}]
     if not drops:
         return selected, strategies, 0
     max_spans = max(3, int(round(_MAX_SPANS_PER_S[mode] * duration_s)))
@@ -557,14 +663,14 @@ def _throttle_density(
         return selected, strategies, 0
 
     keep_ids = {(e.start_sample, e.channel, e.type) for k in keep_keys for e in bins[k]}
-    # Always keep impulse clicks
+    # Always keep impulse clicks / bilateral toks (their own throttle applies)
     keep_ids |= {(e.start_sample, e.channel, e.type) for e in clicks}
     new_selected = [e for e in selected if (e.start_sample, e.channel, e.type) in keep_ids]
     deferred = 0
     for s in strategies:
         if s.get("status") != "planned":
             continue
-        if s.get("type") == "impulse_click":
+        if s.get("type") in {"impulse_click", "bilateral_tok"}:
             continue
         key = (s.get("start_sample"), s.get("channel"), s.get("type"))
         if key not in keep_ids:
@@ -579,6 +685,8 @@ def _choose_strategy(ev: DropoutEvent, report: AnalysisReport, *, mode: RepairMo
     mode = _norm_mode(mode)
     if ev.type == "impulse_click":
         return "declick_interp"
+    if ev.type == "bilateral_tok":
+        return "declick_tok"
     dual_mono = report.stereo_relationship == "dual_mono_like"
     # Full-track mono→two-track / dual-mono: prefer cross-channel borrow whenever donor is usable.
     if ev.channel in {"L", "R"} and _donor_usable(ev, report, dual_mono=dual_mono):
@@ -908,6 +1016,140 @@ def _throttle_impulses(
                 s["reason"] = "revived twin impulse"
                 deferred = max(0, deferred - 1)
     return new_selected, strategies, deferred
+
+
+def _throttle_toks(
+    selected: list[DropoutEvent],
+    strategies: list[dict[str, Any]],
+    duration_s: float,
+    *,
+    mode: RepairMode,
+) -> tuple[list[DropoutEvent], list[dict[str, Any]], int]:
+    """Cap bilateral tok repairs — always keep strong knocks, sparse milder ones."""
+    if not selected or duration_s <= 0:
+        return selected, strategies, 0
+    toks = [e for e in selected if e.type == "bilateral_tok"]
+    if not toks:
+        return selected, strategies, 0
+    always_sev = 0.85 if mode == "conservative" else 0.78
+    # Group L+R by start
+    by_start: dict[int, list[DropoutEvent]] = {}
+    for e in toks:
+        by_start.setdefault(e.start_sample, []).append(e)
+    groups = list(by_start.values())
+    strong = [g for g in groups if max(e.severity for e in g) >= always_sev]
+    mild = [g for g in groups if max(e.severity for e in g) < always_sev]
+    slot_s = 2.0
+    slots: dict[int, list[list[DropoutEvent]]] = {}
+    for g in mild:
+        slots.setdefault(int(g[0].start_s // slot_s), []).append(g)
+    kept_g = list(strong)
+    for _s, gs in slots.items():
+        gs.sort(key=lambda g: -max(e.severity for e in g))
+        kept_g.extend(gs[:1])
+    keep_ids = {(e.start_sample, e.channel, e.type) for g in kept_g for e in g}
+    if len(keep_ids) >= len(toks):
+        return selected, strategies, 0
+    non = [e for e in selected if e.type != "bilateral_tok"]
+    new_selected = non + [e for e in toks if (e.start_sample, e.channel, e.type) in keep_ids]
+    deferred = 0
+    for s in strategies:
+        if s.get("status") != "planned" or s.get("type") != "bilateral_tok":
+            continue
+        key = (s.get("start_sample"), s.get("channel"), s.get("type"))
+        if key not in keep_ids:
+            s["status"] = "deferred"
+            s["strategy"] = "skip_tok_density"
+            s["reason"] = "tok density cap (keep strong knocks; sparse milder)"
+            deferred += 1
+    return new_selected, strategies, deferred
+
+
+def _declick_tok(ch: np.ndarray, a: int, b: int, sr: int, *, strength: float = 0.72) -> None:
+    """Modest Hermite replace for bilateral tok/thump body (~5–6 ms per peak).
+
+    Unlike residual-peak ``_declick_interp``, this targets the low-mid knock envelope
+    that survives spike declick (Samba ~24.438). Searches ±10 ms for neighbor tok
+    bodies (24.438+24.446 cluster) and replaces each with a short partial Hermite so
+    underlying RMS stays up — too-wide full OLA ducks music.
+    """
+    if b <= a or ch.size < 8:
+        return
+    a = max(0, min(int(a), ch.size))
+    b = max(a, min(int(b), ch.size))
+    # Find envelope peaks in a modest search window around the planned span.
+    search = max(int(round(0.010 * sr)), (b - a) // 2)
+    mid = (a + b) // 2
+    lo = max(0, mid - search)
+    hi = min(ch.size, mid + search)
+    seg = ch[lo:hi].astype(np.float64, copy=False)
+    if seg.size < 16:
+        centers = [mid]
+    else:
+        # Cheap |x| smooth ≈ tok body tracker (no FFT in the hot repair path).
+        win = max(3, int(round(0.0015 * sr)))
+        env = np.convolve(np.abs(seg), np.ones(win) / win, mode="same")
+        # Local maxima above median*1.35
+        med = float(np.median(env) + 1e-12)
+        peaks: list[int] = []
+        for i in range(2, env.size - 2):
+            if env[i] >= env[i - 1] and env[i] >= env[i + 1] and env[i] >= 1.35 * med:
+                peaks.append(i)
+        if not peaks:
+            peaks = [int(np.argmax(env))]
+        # Rank by env, NMS ~4 ms, keep up to 3 (tok bursts)
+        peaks.sort(key=lambda i: -env[i])
+        chosen: list[int] = []
+        min_sep = max(4, int(round(0.004 * sr)))
+        for i in peaks:
+            if any(abs(i - j) < min_sep for j in chosen):
+                continue
+            chosen.append(i)
+            if len(chosen) >= 3:
+                break
+        centers = sorted(lo + i for i in chosen)
+
+    core_half = max(4, int(round(0.00275 * sr)))  # ~5.5 ms core
+    wing = max(16, int(round(0.0025 * sr)))
+    strength = float(np.clip(strength, 0.35, 1.0))
+
+    for c in centers:
+        ca = max(0, c - core_half)
+        cb = min(ch.size, c + core_half)
+        if cb - ca < 4:
+            continue
+        a0 = max(0, ca - wing)
+        b0 = min(ch.size, cb + wing)
+        n = b0 - a0
+        left = float(ch[ca - 1]) if ca > 0 else float(ch[ca])
+        right = float(ch[cb]) if cb < ch.size else float(ch[cb - 1])
+        left_slope = float(ch[ca - 1] - ch[ca - 2]) if ca >= 2 else 0.0
+        right_slope = float(ch[cb + 1] - ch[cb]) if cb + 1 < ch.size else 0.0
+        t_core = np.linspace(0.0, 1.0, max(1, cb - ca))
+        t2 = t_core * t_core
+        t3 = t2 * t_core
+        h00 = 2 * t3 - 3 * t2 + 1
+        h10 = t3 - 2 * t2 + t_core
+        h01 = -2 * t3 + 3 * t2
+        h11 = t3 - t2
+        core_fill = h00 * left + h10 * left_slope + h01 * right + h11 * right_slope
+        core_fill = _match_endpoints(core_fill, left, right)
+
+        fill = ch[a0:b0].astype(np.float64, copy=True)
+        fill[ca - a0 : cb - a0] = core_fill
+        w = np.zeros(n, dtype=np.float64)
+        fade_l = ca - a0
+        fade_r = b0 - cb
+        if fade_l > 0:
+            tl = np.linspace(0.0, 1.0, fade_l, endpoint=True)
+            w[:fade_l] = np.sin(0.5 * np.pi * tl) ** 2
+        w[ca - a0 : cb - a0] = 1.0
+        if fade_r > 0:
+            tr = np.linspace(0.0, 1.0, fade_r, endpoint=True)
+            w[cb - a0 :] = np.cos(0.5 * np.pi * tr) ** 2
+        w = w * strength
+        orig = ch[a0:b0].astype(np.float64, copy=False)
+        ch[a0:b0] = w * fill + (1.0 - w) * orig
 
 
 def _declick_interp(ch: np.ndarray, a: int, b: int, sr: int, *, max_new: float = 0.9) -> None:

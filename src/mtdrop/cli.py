@@ -11,8 +11,8 @@ from mtdrop.detect import DetectConfig, analyze, config_for_sensitivity
 from mtdrop.export import write_json_obj, write_report_bundle
 from mtdrop.fixture import synthesize_dropout_wav
 from mtdrop.preview import events_from_dropout_json, export_event_previews, export_padded_clip, loudnorm_mp3
-from mtdrop.repair import apply_repairs
-from mtdrop.wav_io import read_wav
+from mtdrop.repair import apply_repairs, _declick_tok
+from mtdrop.wav_io import channel_matrix, read_wav, write_wav_matching
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -84,7 +84,30 @@ def main(argv: list[str] | None = None) -> int:
     fix_p.add_argument("--azimuth-lag-samples", type=float, default=3.0, help="Inject R lag (stereo)")
     fix_p.add_argument("--level-db", type=float, default=-2.5, help="Inject R level offset dB (stereo)")
 
+    dc_p = sub.add_parser(
+        "declick",
+        help="Manual tok/thump or impulse repair at a time (derived WAV only)",
+    )
+    dc_p.add_argument("input", type=Path, help="Source WAV")
+    dc_p.add_argument("--at", type=float, required=True, help="Center time in seconds")
+    dc_p.add_argument("--out", type=Path, required=True, help="Derived output WAV")
+    dc_p.add_argument(
+        "--width-ms",
+        type=float,
+        default=8.0,
+        help="Half-span search window around --at in ms (default 8)",
+    )
+    dc_p.add_argument(
+        "--strength",
+        type=float,
+        default=0.72,
+        help="Hermite blend strength 0–1 (default 0.72)",
+    )
+
     args = parser.parse_args(argv)
+
+    if args.command == "declick":
+        return _cmd_declick(args)
 
     if args.command == "make-fixture":
         meta = synthesize_dropout_wav(
@@ -311,6 +334,39 @@ def _write_repaired_labels(events: list[dict], path: Path) -> None:
         label = f"repaired|{ev.get('type')}|ch={ev.get('channel')}|{ev.get('strategy')}"
         lines.append(f"{ev['start_s']:.6f}\t{ev['end_s']:.6f}\t{label}")
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def _cmd_declick(args: argparse.Namespace) -> int:
+    """Surgical bilateral tok/thump repair at an explicit time (does not run full detect)."""
+    import numpy as np
+
+    wav = read_wav(args.input)
+    x = channel_matrix(wav.samples).astype(np.float64, copy=True)
+    sr = wav.sample_rate
+    center = float(args.at)
+    half = max(4, int(round(abs(args.width_ms) * 0.001 * sr)))
+    c = int(round(center * sr))
+    a = max(0, c - half)
+    b = min(x.shape[0], c + half)
+    strength = float(max(0.35, min(1.0, args.strength)))
+    for ci in range(x.shape[1]):
+        _declick_tok(x[:, ci], a, b, sr, strength=strength)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    write_wav_matching(args.out, x, like=wav)
+    print(
+        json.dumps(
+            {
+                "input": str(args.input),
+                "output": str(args.out),
+                "at_s": center,
+                "span_s": [a / sr, b / sr],
+                "strength": strength,
+                "strategy": "declick_tok",
+            },
+            indent=2,
+        )
+    )
+    return 0
 
 
 def _cmd_ui(args: argparse.Namespace) -> int:

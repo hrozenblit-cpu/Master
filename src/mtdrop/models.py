@@ -3,7 +3,14 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-DropoutType = Literal["level_dip", "hard_mute", "hf_loss", "channel_asymmetry", "impulse_click"]
+DropoutType = Literal[
+    "level_dip",
+    "hard_mute",
+    "hf_loss",
+    "channel_asymmetry",
+    "impulse_click",
+    "bilateral_tok",
+]
 DurationClass = Literal["micro", "short", "medium", "long"]
 ChannelTag = Literal["mono", "L", "R", "both", "L>R", "R>L"]
 StereoRelationship = Literal["mono", "dual_mono_like", "true_stereo", "unknown"]
