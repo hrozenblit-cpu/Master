@@ -1,7 +1,7 @@
 mtdrop — ferramenta local para dropouts de fita (Master Tools)
 ==============================================================
-Build: 2026-10-09-tok-025-v3  (use este ZIP fresco — nao reaproveite pasta antiga)
-UI: para Samba, repair=aggressive; tok/thump bilateral ~0:25 (nao so click seco) no pipeline padrao.
+Build: 2026-10-09-batch-ui-v1  (use este ZIP fresco — nao reaproveite pasta antiga)
+UI: aba Lote processa varios WAVs; Samba = repair aggressive + tok/thump ~0:25 no pipeline.
 
 O codigo NAO esta no branch "main" do GitHub (la so ha um README).
 Use este ZIP (branch do PR) ou a pasta extraida dele.
@@ -24,8 +24,17 @@ COMO USAR (Windows)
    Abra ESSE URL no navegador (pode ser 7860, 7861, … se 7860
    estiver ocupada).
 
-5) Carregue um WAV, marque correct/repair, clique em Run,
+5) Arquivo unico: carregue um WAV, marque correct/repair, Run,
    e escute original / corrigido / reparado.
+
+6) LOTE (varios arquivos):
+   - Aba "Lote / Batch"
+   - Selecione varios WAVs e/ou cole o caminho de uma pasta
+   - Clique "Montar fila" — edite Titulo / Artista / Nº se quiser
+   - Pasta de saida (padrao: pasta do usuario\mtdrop-saidas)
+   - Reparo padrao do lote = aggressive (Samba)
+   - "Processar lote" — cada faixa e SALVA NA HORA em reparados\
+     Nome: 01_[Nome da Musica] - [Artista] - reparado.wav
 
 REQUISITOS
 ----------
@@ -50,12 +59,12 @@ do arquivo de entrada (ex.: 88.2 kHz/24-bit -> 88.2/24).
 
 REPARO PADRAO
 -------------
-O modo conservative (padrao na UI) protege voz/letra: so preenche
-mudos/dips profundos e estalos curtos. Use aggressive so se o dropout
-for grave e voce aceitar fills mais invasivos.
+Arquivo unico: conservative (protege voz/letra).
+Lote: aggressive (Helio/Samba) — mude na aba se precisar.
+Estalos secos + tok/thump bilateral entram no pipeline padrao.
 
 PLAYERS NA UI
 -------------
 1) Original = entrada
 2) Corrigido = so azimuth + nivel (NAO e o final)
-3) REPARADO = resultado final (alinhamento + dropouts + de-click)
+3) REPARADO = resultado final (alinhamento + dropouts + de-click/tok)

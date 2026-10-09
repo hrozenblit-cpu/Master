@@ -1,6 +1,6 @@
-"""Local Gradio UI for full-file mtdrop listen / A-B testing.
+"""Local Gradio UI for full-file mtdrop listen / A-B testing + batch queue.
 
-Never overwrites the uploaded source — all outputs go to a temp work dir.
+Never overwrites the uploaded source — all outputs go to a work dir or chosen folder.
 """
 
 from __future__ import annotations
@@ -8,10 +8,12 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from mtdrop.align import apply_corrections, measure_azimuth, measure_level
+from mtdrop.batch_names import batch_output_filename, title_from_filename
 from mtdrop.detect import analyze, config_for_sensitivity
 from mtdrop.export import write_json_obj, write_report_bundle
 from mtdrop.repair import apply_repairs
@@ -25,15 +27,20 @@ def _run_pipeline(
     repair_mode: str,
     sensitivity: str,
     progress: Any = None,
+    work_dir: Path | None = None,
 ) -> dict[str, Any]:
     wav_path = Path(wav_path)
-    work = Path(tempfile.mkdtemp(prefix="mtdrop_ui_"))
+    work = Path(work_dir) if work_dir is not None else Path(tempfile.mkdtemp(prefix="mtdrop_ui_"))
+    work.mkdir(parents=True, exist_ok=True)
     logs: list[str] = []
 
     def tick(frac: float, msg: str) -> None:
         logs.append(msg)
         if progress is not None:
-            progress(frac, desc=msg)
+            try:
+                progress(frac, desc=msg)
+            except TypeError:
+                progress(frac)
 
     tick(0.05, f"Reading {wav_path.name}")
     wav = read_wav(wav_path)
@@ -111,10 +118,205 @@ def _run_pipeline(
     return summary
 
 
+def _file_obj_path(file_obj: Any) -> Path | None:
+    if file_obj is None:
+        return None
+    if isinstance(file_obj, (str, Path)):
+        p = Path(file_obj)
+        return p if p.suffix.lower() == ".wav" else None
+    name = getattr(file_obj, "name", None) or getattr(file_obj, "path", None)
+    if name:
+        p = Path(str(name))
+        return p if p.suffix.lower() == ".wav" else None
+    return None
+
+
+def _collect_wav_paths(
+    files: Any,
+    folder_path: str | None,
+) -> list[Path]:
+    """Merge multi-file upload + optional folder glob; stable order, unique paths."""
+    found: list[Path] = []
+    if files:
+        items = files if isinstance(files, (list, tuple)) else [files]
+        for item in items:
+            p = _file_obj_path(item)
+            if p is not None and p.is_file():
+                found.append(p.resolve())
+    folder = (folder_path or "").strip()
+    if folder:
+        root = Path(folder).expanduser()
+        if root.is_dir():
+            found.extend(sorted(p.resolve() for p in root.rglob("*.wav") if p.is_file()))
+        elif root.is_file() and root.suffix.lower() == ".wav":
+            found.append(root.resolve())
+    # unique, preserve order
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for p in found:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def build_queue_rows(files: Any, folder_path: str | None, artist_default: str = "") -> list[list[str]]:
+    """Build dataframe rows: Nº | Título | Artista | Arquivo | Status."""
+    paths = _collect_wav_paths(files, folder_path)
+    rows: list[list[str]] = []
+    for i, p in enumerate(paths, start=1):
+        rows.append(
+            [
+                f"{i:02d}",
+                title_from_filename(p),
+                (artist_default or "").strip(),
+                str(p),
+                "na fila",
+            ]
+        )
+    return rows
+
+
+def _resolve_batch_out_dir(out_folder: str, *, dated_subfolder: bool) -> Path:
+    base = Path((out_folder or "").strip() or str(Path.home() / "mtdrop-saidas")).expanduser()
+    if dated_subfolder:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = base / f"reparados_{stamp}"
+    else:
+        dest = base / "reparados"
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest
+
+
+def _unique_path(path: Path) -> Path:
+    """Never overwrite: if exists, append _2, _3, …"""
+    if not path.exists():
+        return path
+    stem, ext = path.stem, path.suffix
+    n = 2
+    while True:
+        cand = path.with_name(f"{stem}_{n}{ext}")
+        if not cand.exists():
+            return cand
+        n += 1
+
+
+def process_batch(
+    rows: list[list[Any]] | Any,
+    *,
+    out_folder: str,
+    dated_subfolder: bool,
+    do_correct: bool,
+    repair_mode: str,
+    sensitivity: str,
+    progress: Any = None,
+) -> Iterator[tuple[list[list[str]], str, list[str], str]]:
+    """Yield (table, status, completed_paths, log) after each file — save immediately."""
+    # Normalize dataframe input (pandas / list / numpy)
+    if rows is None:
+        yield [], "Fila vazia — carregue WAVs ou informe uma pasta.", [], ""
+        return
+    if hasattr(rows, "values"):
+        data = [list(r) for r in rows.values.tolist()]
+    else:
+        data = [list(r) for r in rows]
+    if not data:
+        yield [], "Fila vazia — carregue WAVs ou informe uma pasta.", [], ""
+        return
+
+    dest = _resolve_batch_out_dir(out_folder, dated_subfolder=dated_subfolder)
+    completed: list[str] = []
+    log_lines: list[str] = [f"Pasta de saída: {dest}"]
+    total = len(data)
+    ok = 0
+    err = 0
+
+    for i, row in enumerate(data):
+        # Pad short rows
+        while len(row) < 5:
+            row.append("")
+        num, title, artist, src_s, _status = (str(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4]))
+        src = Path(src_s).expanduser()
+        data[i][4] = "processando…"
+        overall = (i / max(1, total)) * 0.95
+        if progress is not None:
+            try:
+                progress(overall, desc=f"[{i+1}/{total}] {src.name}")
+            except TypeError:
+                progress(overall)
+        yield [list(r) for r in data], f"Processando {i+1}/{total}: {src.name}", list(completed), "\n".join(log_lines)
+
+        if not src.is_file():
+            data[i][4] = "ERRO: arquivo não encontrado"
+            err += 1
+            log_lines.append(f"ERRO [{num}] {src}: não encontrado")
+            yield [list(r) for r in data], f"Erro em {i+1}/{total}", list(completed), "\n".join(log_lines)
+            continue
+
+        try:
+            work = Path(tempfile.mkdtemp(prefix="mtdrop_batch_"))
+            summary = _run_pipeline(
+                src,
+                do_correct=bool(do_correct),
+                repair_mode=repair_mode,
+                sensitivity=sensitivity,
+                work_dir=work,
+            )
+            # Prefer repaired; fall back to corrected if repair off
+            deliverable = summary.get("repaired_wav") or summary.get("corrected_wav")
+            if not deliverable:
+                raise RuntimeError("Nenhum WAV de saída (ligue repair ou correct)")
+
+            out_name = batch_output_filename(num, title, artist, suffix="reparado", ext=".wav")
+            out_path = _unique_path(dest / out_name)
+            shutil.copy2(deliverable, out_path)
+
+            # Sidecar reports next to deliverable (same stem prefix)
+            stem_base = out_path.with_suffix("")
+            for key, label in (
+                ("dropouts_json", ".dropouts.json"),
+                ("alignment_json", ".alignment.json"),
+                ("repair_json", ".repair.json"),
+            ):
+                src_json = summary.get(key)
+                if src_json and Path(src_json).is_file():
+                    shutil.copy2(src_json, Path(str(stem_base) + label))
+
+            completed.append(str(out_path))
+            ok += 1
+            data[i][4] = f"OK → {out_path.name}"
+            log_lines.append(
+                f"OK [{num}] {src.name} → {out_path.name} "
+                f"(events={summary.get('event_count')}, repaired={summary.get('repaired_count')})"
+            )
+            # Clean temp work (deliverable already copied)
+            shutil.rmtree(work, ignore_errors=True)
+        except Exception as exc:  # noqa: BLE001 — continue batch
+            err += 1
+            data[i][4] = f"ERRO: {exc}"
+            log_lines.append(f"ERRO [{num}] {src.name}: {exc}")
+
+        yield (
+            [list(r) for r in data],
+            f"Progresso {i+1}/{total} — OK={ok} · erros={err} · pasta={dest}",
+            list(completed),
+            "\n".join(log_lines),
+        )
+
+    if progress is not None:
+        try:
+            progress(1.0, desc="Lote concluído")
+        except TypeError:
+            progress(1.0)
+    final = f"Lote concluído: {ok} OK, {err} erro(s), total {total}. Saída: {dest}"
+    log_lines.append(final)
+    yield [list(r) for r in data], final, list(completed), "\n".join(log_lines)
+
+
 def build_app():
     import gradio as gr
 
-    def run(file_obj, do_correct, repair_mode, sensitivity, progress=gr.Progress()):
+    def run_single(file_obj, do_correct, repair_mode, sensitivity, progress=gr.Progress()):
         if file_obj is None:
             raise gr.Error("Load a WAV first")
         path = file_obj if isinstance(file_obj, str) else getattr(file_obj, "name", None) or str(file_obj)
@@ -155,80 +357,193 @@ def build_app():
             json.dumps({k: v for k, v in summary.items() if k != "log"}, indent=2),
         )
 
+    def load_queue(files, folder, artist_default):
+        rows = build_queue_rows(files, folder, artist_default or "")
+        if not rows:
+            return [], "Nenhum WAV encontrado."
+        return rows, f"{len(rows)} arquivo(s) na fila."
+
+    def run_batch(table, out_folder, dated, do_correct, repair_mode, sensitivity, progress=gr.Progress()):
+        yield from process_batch(
+            table,
+            out_folder=out_folder or "",
+            dated_subfolder=bool(dated),
+            do_correct=bool(do_correct),
+            repair_mode=repair_mode,
+            sensitivity=sensitivity,
+            progress=progress,
+        )
+
+    default_out = str(Path.home() / "mtdrop-saidas")
+
     with gr.Blocks(title="mtdrop — tape dropout tool") as demo:
         gr.Markdown(
             """
 # mtdrop — interface local / local listen UI
 
-Pipeline: detect → **corrigido/corrected** (só azimuth + nível L/R) → **reparado/repaired** (resultado final: dropouts + estalos/clicks da fonte).
+Pipeline: detect → **corrigido/corrected** (só azimuth + nível L/R) → **reparado/repaired** (resultado final: dropouts + estalos/clicks + tok/thump).
 
 | Faixa / Player | PT | EN |
 |---|---|---|
 | **Original** | Arquivo de entrada (pode já ter estalos) | Source WAV (may already contain ticks/pops) |
 | **Corrigido** | Só alinhamento (azimuth + ganho L/R) — **não** é o resultado final | Alignment only — **not** the final result |
-| **Reparado** | **Resultado final** (alinhamento + dropouts + de-click) | **Final output** (alignment + dropout + de-click) |
+| **Reparado** | **Resultado final** (alinhamento + dropouts + de-click/tok) | **Final output** (alignment + dropout + de-click) |
 
-**Reparo padrão = conservative (protege voz/letra).** Não substitui sílabas com fill inventado. Use `aggressive` só se o dropout for grave e você aceitar mais invasão.
-
+**Arquivo único:** reparo padrão = `conservative` (protege voz).  
+**Lote:** reparo padrão = `aggressive` (Helio / Samba) — mude se precisar.  
 O WAV de origem **nunca** é sobrescrito. Saídas mantêm taxa / bits / canais do input.
             """
         )
-        with gr.Row():
-            inp = gr.File(label="WAV (≤192 kHz / 24-bit, mono or stereo)", file_types=[".wav"])
-            with gr.Column():
-                do_correct = gr.Checkbox(
-                    value=True,
-                    label="Corrigir azimuth + nível L/R / Correct azimuth + L/R level",
+
+        with gr.Tabs():
+            with gr.Tab("Arquivo único"):
+                with gr.Row():
+                    inp = gr.File(label="WAV (≤192 kHz / 24-bit, mono or stereo)", file_types=[".wav"])
+                    with gr.Column():
+                        do_correct = gr.Checkbox(
+                            value=True,
+                            label="Corrigir azimuth + nível L/R / Correct azimuth + L/R level",
+                        )
+                        repair_mode = gr.Radio(
+                            choices=["conservative", "aggressive", "off"],
+                            value="conservative",
+                            label=(
+                                "Reparo / Repair — conservative = protege voz/letra (padrão); "
+                                "aggressive = mais invasivo"
+                            ),
+                        )
+                        sensitivity = gr.Radio(
+                            choices=["balanced", "aggressive", "conservative"],
+                            value="balanced",
+                            label="Sensibilidade / Sensitivity",
+                        )
+                        run_btn = gr.Button("Rodar mtdrop / Run", variant="primary")
+
+                status = gr.Textbox(label="Resumo / Summary", interactive=False)
+                log = gr.Textbox(label="Log", lines=4, interactive=False)
+
+                gr.Markdown(
+                    "### Ouça o arquivo inteiro / Full-file A–B\n"
+                    "**Use REPARADO como resultado final.** Corrigido = só azimuth/nível."
                 )
-                repair_mode = gr.Radio(
-                    choices=["conservative", "aggressive", "off"],
-                    value="conservative",
-                    label=(
-                        "Reparo / Repair — conservative = protege voz/letra (padrão); "
-                        "aggressive = mais invasivo"
-                    ),
+                with gr.Row():
+                    aud_orig = gr.Audio(
+                        label="1) Original (entrada / source)",
+                        type="filepath",
+                        interactive=False,
+                    )
+                    aud_corr = gr.Audio(
+                        label="2) Corrigido / Corrected — só azimuth+nível (NÃO é o final)",
+                        type="filepath",
+                        interactive=False,
+                    )
+                    aud_rep = gr.Audio(
+                        label="3) REPARADO / REPAIRED — resultado final ★",
+                        type="filepath",
+                        interactive=False,
+                    )
+
+                downloads = gr.Files(
+                    label="Download — use o *.repaired.wav como resultado final / final deliverable"
                 )
-                sensitivity = gr.Radio(
-                    choices=["balanced", "aggressive", "conservative"],
-                    value="balanced",
-                    label="Sensibilidade / Sensitivity",
+                summary_json = gr.Code(label="JSON do run", language="json")
+
+                run_btn.click(
+                    run_single,
+                    inputs=[inp, do_correct, repair_mode, sensitivity],
+                    outputs=[status, log, aud_orig, aud_corr, aud_rep, downloads, summary_json],
                 )
-                run_btn = gr.Button("Rodar mtdrop / Run", variant="primary")
 
-        status = gr.Textbox(label="Resumo / Summary", interactive=False)
-        log = gr.Textbox(label="Log", lines=4, interactive=False)
+            with gr.Tab("Lote / Batch"):
+                gr.Markdown(
+                    """
+### Fila em lote
+1. Selecione **vários WAVs** e/ou informe o caminho de uma **pasta**.
+2. Clique **Montar fila** — edite **Nº**, **Título**, **Artista** na tabela.
+3. Escolha a **pasta de saída** (os arquivos vão para `reparados/` dentro dela).
+4. Clique **Processar lote** — cada arquivo é **salvo na hora** (não espera o lote inteiro).
 
-        gr.Markdown(
-            "### Ouça o arquivo inteiro / Full-file A–B\n"
-            "**Use REPARADO como resultado final.** Corrigido = só azimuth/nível."
-        )
-        with gr.Row():
-            aud_orig = gr.Audio(
-                label="1) Original (entrada / source)",
-                type="filepath",
-                interactive=False,
-            )
-            aud_corr = gr.Audio(
-                label="2) Corrigido / Corrected — só azimuth+nível (NÃO é o final)",
-                type="filepath",
-                interactive=False,
-            )
-            aud_rep = gr.Audio(
-                label="3) REPARADO / REPAIRED — resultado final ★",
-                type="filepath",
-                interactive=False,
-            )
+Nome de saída: `01_[Nome da Musica] - [Artista] - reparado.wav`
+                    """
+                )
+                with gr.Row():
+                    batch_files = gr.File(
+                        label="WAVs (múltiplos) / Multiple WAVs",
+                        file_types=[".wav"],
+                        file_count="multiple",
+                    )
+                    with gr.Column():
+                        batch_folder = gr.Textbox(
+                            label="Ou pasta com WAVs (caminho absoluto) / Or folder path",
+                            placeholder=r"C:\Transfers\Samba  ou  /home/…/wavs",
+                        )
+                        batch_artist = gr.Textbox(
+                            label="Artista padrão (preenche a fila) / Default artist",
+                            placeholder="Nome do artista",
+                        )
+                        load_btn = gr.Button("Montar fila / Build queue", variant="secondary")
 
-        downloads = gr.Files(
-            label="Download — use o *.repaired.wav como resultado final / final deliverable"
-        )
-        summary_json = gr.Code(label="JSON do run", language="json")
+                batch_table = gr.Dataframe(
+                    headers=["Nº", "Título", "Artista", "Arquivo", "Status"],
+                    datatype=["str", "str", "str", "str", "str"],
+                    col_count=(5, "fixed"),
+                    label="Fila (editável) — Nº / Título / Artista",
+                    interactive=True,
+                    wrap=True,
+                )
+                batch_queue_status = gr.Textbox(label="Fila", interactive=False)
 
-        run_btn.click(
-            run,
-            inputs=[inp, do_correct, repair_mode, sensitivity],
-            outputs=[status, log, aud_orig, aud_corr, aud_rep, downloads, summary_json],
-        )
+                with gr.Row():
+                    batch_out = gr.Textbox(
+                        label="Pasta de saída / Output folder",
+                        value=default_out,
+                        info="Cria subpasta reparados/ (ou reparados_AAAAMMDD_HHMMSS se marcado)",
+                    )
+                    batch_dated = gr.Checkbox(
+                        value=False,
+                        label="Subpasta datada / Dated subfolder (reparados_YYYYMMDD_HHMMSS)",
+                    )
+
+                with gr.Row():
+                    batch_correct = gr.Checkbox(
+                        value=True,
+                        label="Corrigir azimuth + nível L/R",
+                    )
+                    batch_repair = gr.Radio(
+                        choices=["aggressive", "conservative", "off"],
+                        value="aggressive",
+                        label="Reparo no lote (padrão aggressive — Samba/Helio)",
+                    )
+                    batch_sens = gr.Radio(
+                        choices=["balanced", "aggressive", "conservative"],
+                        value="balanced",
+                        label="Sensibilidade",
+                    )
+
+                batch_run = gr.Button("Processar lote / Run batch", variant="primary")
+                batch_status = gr.Textbox(label="Progresso do lote / Batch progress", interactive=False)
+                batch_log = gr.Textbox(label="Log do lote", lines=8, interactive=False)
+                batch_downloads = gr.Files(
+                    label="Arquivos concluídos (atualiza a cada faixa) / Completed files (per-track)"
+                )
+
+                load_btn.click(
+                    load_queue,
+                    inputs=[batch_files, batch_folder, batch_artist],
+                    outputs=[batch_table, batch_queue_status],
+                )
+                batch_run.click(
+                    run_batch,
+                    inputs=[
+                        batch_table,
+                        batch_out,
+                        batch_dated,
+                        batch_correct,
+                        batch_repair,
+                        batch_sens,
+                    ],
+                    outputs=[batch_table, batch_status, batch_downloads, batch_log],
+                )
 
     return demo
 
@@ -288,7 +603,8 @@ def launch(
         "============================================\n"
         f"  mtdrop UI → {url}\n"
         "============================================\n"
-        "Abra este URL no navegador / Open this URL in your browser.\n",
+        "Abra este URL no navegador / Open this URL in your browser.\n"
+        "Aba Lote: selecione vários WAVs → Montar fila → Processar lote.\n",
         flush=True,
     )
     demo = build_app()

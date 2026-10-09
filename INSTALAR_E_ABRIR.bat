@@ -5,7 +5,7 @@ cd /d "%~dp0"
 echo.
 echo ============================================
 echo  mtdrop - instalacao e interface local
-echo  Build: 2026-10-09-tok-025-v3
+echo  Build: 2026-10-09-batch-ui-v1
 echo ============================================
 echo.
 echo Pasta: %CD%

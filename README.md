@@ -52,7 +52,7 @@ mtdrop analyze input.wav --out ./out --sensitivity conservative
 mtdrop analyze input.wav --out ./out --sensitivity aggressive  # mild dips; more FPs
 ```
 
-### Local listen UI (full-file A/B)
+### Local listen UI (full-file A/B + batch)
 
 ```bash
 pip install -e ".[ui]"
@@ -61,7 +61,13 @@ mtdrop ui
 # or: mtdrop ui --host 127.0.0.1 --port 7860
 ```
 
-Upload a WAV → toggle correct / repair / sensitivity → play **full** original vs corrected vs repaired in the browser → download derived WAVs + JSON. Source file is never overwritten.
+**Single file:** upload a WAV → toggle correct / repair / sensitivity → play **full** original vs corrected vs repaired → download derived WAVs + JSON.
+
+**Batch (aba Lote):** select multiple WAVs and/or a folder path → **Montar fila** → edit Nº / Título / Artista → set output folder → **Processar lote**. Each finished track is written immediately under `reparados/` as:
+
+`01_[Nome da Musica] - [Artista] - reparado.wav`
+
+Batch repair defaults to **aggressive** (Helio/Samba). Source masters are never overwritten; format (sr / bits / channels) is preserved.
 
 ### Listen previews (≥2.5 s — do not ship sub-second clips)
 
@@ -116,5 +122,5 @@ pytest -q
 | A — detect + markers + azimuth/level measure | Ships |
 | B — gated `--correct` → derived WAV | Ships |
 | C — gated `--repair` → derived repaired WAV | Ships (conservative) |
-| Local Gradio listen UI (`mtdrop ui`) | Ships (single-file); batch-folder UI later |
+| Local Gradio listen UI (`mtdrop ui`) | Ships (single-file + batch queue) |
 | Calibration on Helio full-track→two-track clips | First pass done; more A80 reels needed |
