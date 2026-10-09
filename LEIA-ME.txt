@@ -1,7 +1,7 @@
 mtdrop — ferramenta local para dropouts de fita (Master Tools)
 ==============================================================
-Build: 2026-10-09-declick-025-v2  (use este ZIP fresco — nao reaproveite pasta antiga)
-UI: para Samba, repair=aggressive ok; o de-click do estalo ~0:25 roda nos dois modos.
+Build: 2026-10-09-tok-025-v3  (use este ZIP fresco — nao reaproveite pasta antiga)
+UI: para Samba, repair=aggressive; tok/thump bilateral ~0:25 (nao so click seco) no pipeline padrao.
 
 O codigo NAO esta no branch "main" do GitHub (la so ha um README).
 Use este ZIP (branch do PR) ou a pasta extraida dele.
