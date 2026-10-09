@@ -44,19 +44,35 @@ if errorlevel 1 (
 echo.
 echo [2/2] Abrindo a interface...
 echo.
-echo Quando aparecer "Running on local URL", abra no navegador:
+echo A UI escolhe uma porta livre automaticamente (7860-7870).
+echo Leia nesta janela a linha:
 echo.
-echo   http://127.0.0.1:7860
+echo   mtdrop UI -^> http://127.0.0.1:XXXX
+echo.
+echo e abra ESSE URL no navegador (pode nao ser 7860).
+echo.
+echo Se a porta estiver ocupada por um mtdrop antigo:
+echo   - Feche a outra janela preta (Ctrl+C) e tente de novo, ou
+echo   - Deixe este script; ele usa a proxima porta livre.
 echo.
 echo Deixe esta janela aberta enquanto usar o mtdrop.
 echo Feche com Ctrl+C para encerrar.
 echo.
 
-%PY% -m mtdrop ui --host 127.0.0.1 --port 7860
+REM Prefer 7860; Python falls back through 7870 if busy.
+REM Override manually, e.g.: set MTDROP_PORT=7875
+if defined MTDROP_PORT (
+  set "PORT_ARGS=--port %MTDROP_PORT%"
+) else (
+  set "PORT_ARGS=--port 7860 --port-span 11"
+)
+
+%PY% -m mtdrop ui --host 127.0.0.1 %PORT_ARGS%
 if errorlevel 1 (
   echo.
   echo [ERRO] Nao foi possivel iniciar a UI.
-  echo Confirme a instalacao e tente de novo.
+  echo Confirme a instalacao. Se a porta falhar, feche outras janelas
+  echo do mtdrop ou rode:  %PY% -m mtdrop ui --port 0
   echo.
   pause
   exit /b 1

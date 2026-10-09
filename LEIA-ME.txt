@@ -15,9 +15,12 @@ COMO USAR (Windows)
    (precisa ter Python 3.10+ instalado, com "Add to PATH").
 
 4) Quando a instalacao terminar, a interface abre.
-   No navegador, abra:
+   Leia na janela preta a linha:
 
-      http://127.0.0.1:7860
+      mtdrop UI → http://127.0.0.1:XXXX
+
+   Abra ESSE URL no navegador (pode ser 7860, 7861, … se 7860
+   estiver ocupada).
 
 5) Carregue um WAV, marque correct/repair, clique em Run,
    e escute original / corrigido / reparado.
@@ -32,7 +35,11 @@ PROBLEMAS COMUNS
 ----------------
 - "Python nao encontrado": reinstale o Python marcando PATH,
   feche e abra de novo o Explorer, e tente o .bat outra vez.
-- Porta 7860 ocupada: feche outro mtdrop/Gradio e tente de novo.
+- "Cannot find empty port" / porta ocupada:
+  1) Feche a outra janela do mtdrop (Ctrl+C) e rode o .bat de novo; ou
+  2) O script ja tenta 7860–7870 sozinho — use o URL impresso; ou
+  3) No terminal nesta pasta:
+       py -3 -m mtdrop ui --port 0
 - Antivirus bloqueando pip: permita temporariamente e repita.
 
 O arquivo WAV original NUNCA e sobrescrito.
@@ -44,3 +51,9 @@ REPARO PADRAO
 O modo conservative (padrao na UI) protege voz/letra: so preenche
 mudos/dips profundos e estalos curtos. Use aggressive so se o dropout
 for grave e voce aceitar fills mais invasivos.
+
+PLAYERS NA UI
+-------------
+1) Original = entrada
+2) Corrigido = so azimuth + nivel (NAO e o final)
+3) REPARADO = resultado final (alinhamento + dropouts + de-click)

@@ -88,6 +88,26 @@ def test_correct_writes_derived_wav(tmp_path: Path) -> None:
     assert applied["level"] is not None
 
 
+def test_ui_picks_next_port_when_preferred_busy() -> None:
+    import socket
+
+    from mtdrop.ui import pick_listen_port
+
+    host = "127.0.0.1"
+    held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Bind an ephemeral port, then ask picker to skip it
+    held.bind((host, 0))
+    busy = int(held.getsockname()[1])
+    held.listen(1)
+    try:
+        chosen = pick_listen_port(host, preferred=busy, span=5)
+        assert chosen != busy
+        assert busy < chosen < busy + 5
+    finally:
+        held.close()
+
+
 def test_impulse_click_detect_and_declick(tmp_path: Path) -> None:
     """Synthetic tick in music-like noise should be detected and attenuated."""
     sr = 44100

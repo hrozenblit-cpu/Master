@@ -40,7 +40,18 @@ def main(argv: list[str] | None = None) -> int:
 
     ui_p = sub.add_parser("ui", help="Launch local Gradio listen UI (full-file A/B)")
     ui_p.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1)")
-    ui_p.add_argument("--port", type=int, default=7860, help="Port (default 7860)")
+    ui_p.add_argument(
+        "--port",
+        type=int,
+        default=7860,
+        help="Preferred port (default 7860). If busy, tries the next ports up to --port-span. Use 0 for any free port.",
+    )
+    ui_p.add_argument(
+        "--port-span",
+        type=int,
+        default=11,
+        help="How many ports to try starting at --port (default 11 → 7860–7870)",
+    )
     ui_p.add_argument("--share", action="store_true", help="Create Gradio public share link")
 
     prev_p = sub.add_parser(
@@ -312,8 +323,12 @@ def _cmd_ui(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"Starting mtdrop UI at http://{args.host}:{args.port}")
-    launch(host=args.host, port=args.port, share=args.share)
+    launch(
+        host=args.host,
+        port=args.port,
+        share=args.share,
+        port_span=max(1, int(args.port_span)),
+    )
     return 0
 
 

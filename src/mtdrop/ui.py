@@ -233,6 +233,70 @@ O WAV de origem **nunca** é sobrescrito. Saídas mantêm taxa / bits / canais d
     return demo
 
 
-def launch(host: str = "127.0.0.1", port: int = 7860, share: bool = False) -> None:
+def _port_available(host: str, port: int) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def pick_listen_port(host: str = "127.0.0.1", preferred: int = 7860, span: int = 11) -> int:
+    """Return preferred port, or the next free port in [preferred, preferred+span).
+
+    ``preferred=0`` asks the OS for any free ephemeral port.
+    """
+    import socket
+
+    if preferred == 0:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, 0))
+            return int(sock.getsockname()[1])
+
+    last = preferred + max(1, span)
+    for port in range(preferred, last):
+        if _port_available(host, port):
+            return port
+    raise OSError(
+        f"Cannot find empty port in range: {preferred}-{last - 1}. "
+        "Feche outra janela do mtdrop/Gradio ou use: mtdrop ui --port 0"
+    )
+
+
+def launch(
+    host: str = "127.0.0.1",
+    port: int = 7860,
+    share: bool = False,
+    *,
+    port_span: int = 11,
+) -> int:
+    """Launch Gradio UI. Returns the port actually bound."""
+    chosen = pick_listen_port(host, preferred=port, span=port_span)
+    if chosen != port and port != 0:
+        print(
+            f"Porta {port} ocupada — usando {chosen} em vez disso.\n"
+            f"Port {port} busy — using {chosen} instead.",
+            flush=True,
+        )
+    url = f"http://{host}:{chosen}"
+    print(
+        "\n"
+        "============================================\n"
+        f"  mtdrop UI → {url}\n"
+        "============================================\n"
+        "Abra este URL no navegador / Open this URL in your browser.\n",
+        flush=True,
+    )
     demo = build_app()
-    demo.queue().launch(server_name=host, server_port=port, share=share, show_error=True)
+    demo.queue().launch(
+        server_name=host,
+        server_port=chosen,
+        share=share,
+        show_error=True,
+        inbrowser=False,
+    )
+    return chosen
