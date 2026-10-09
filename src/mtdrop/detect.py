@@ -43,17 +43,19 @@ class DetectConfig:
     # Tuned on Helio Samba ``15022_02_QG_do_Samba_OK.wav`` (~0:25 and similar).
     detect_impulse_clicks: bool = True
     # |sample − linear neighbors| must exceed this × local MAD.
-    impulse_mad_k: float = 7.0
-    # Absolute residual floor (full-scale) so quiet sections don't flood.
-    impulse_abs_floor: float = 0.007
-    # Half-width of repair pad around peak (seconds).
-    impulse_pad_s: float = 0.0009
+    impulse_mad_k: float = 6.5
+    # Absolute residual floor (full-scale). 0.005 catches Samba ~0:25 after azimuth
+    # (corr softens residual below the old 0.007 floor).
+    impulse_abs_floor: float = 0.005
+    # Half-width of repair pad around peak (seconds). Wider pad keeps the peak
+    # away from splice edges so declick doesn't leave edge ticks.
+    impulse_pad_s: float = 0.0016
     # Max merged click length (seconds); longer → not a tick.
-    impulse_max_dur_s: float = 0.006
+    impulse_max_dur_s: float = 0.008
     # Min severity to keep an impulse_click event.
-    impulse_severity_threshold: float = 0.48
+    impulse_severity_threshold: float = 0.45
     # Hard cap per file (time-stratified keep) — avoids over-splicing bright music.
-    impulse_max_events: int = 200
+    impulse_max_events: int = 220
 
 
 SENSITIVITY_PRESETS: dict[str, dict[str, float]] = {
@@ -298,12 +300,68 @@ def _detect_impulse_clicks(x: np.ndarray, sr: int, cfg: DetectConfig) -> list[Dr
 
     Calibrated on Helio ``15022_02_QG_do_Samba_OK.wav`` (~0:25 and similar).
     These are *in the transfer*, not invented by repair — Master Tool should remove them.
+
+    On stereo, also scan the mid mix so shared ticks aren't missed after azimuth, and
+    mirror hits onto both L and R so dual-mono repairs stay balance-linked.
     """
     n_ch = x.shape[1]
     out: list[DropoutEvent] = []
     for ch_i in range(n_ch):
         tag: ChannelTag = "mono" if n_ch == 1 else ("L" if ch_i == 0 else "R")
         out.extend(_impulse_clicks_channel(x[:, ch_i], sr, cfg, tag))
+    if n_ch >= 2:
+        mid = 0.5 * (x[:, 0] + x[:, 1])
+        mid_hits = _impulse_clicks_channel(mid, sr, cfg, "L")  # channel tag rewritten below
+        # Index existing by approx start (2 ms bins) per channel
+        have = {(e.channel, int(round(e.start_s * 500.0))) for e in out}
+        for hit in mid_hits:
+            for tag in ("L", "R"):
+                key = (tag, int(round(hit.start_s * 500.0)))
+                if key in have:
+                    continue
+                out.append(
+                    DropoutEvent(
+                        start_s=hit.start_s,
+                        end_s=hit.end_s,
+                        start_sample=hit.start_sample,
+                        end_sample=hit.end_sample,
+                        channel=tag,  # type: ignore[arg-type]
+                        type="impulse_click",
+                        severity=hit.severity,
+                        confidence=hit.confidence,
+                        duration_class=hit.duration_class,
+                        notes="source tick/pop (mid-mix); linked L/R for dual-mono balance",
+                    )
+                )
+                have.add(key)
+        # Mirror any remaining single-channel hit onto the sibling within 2 ms
+        by_ch: dict[str, list[DropoutEvent]] = {"L": [], "R": []}
+        for e in out:
+            if e.channel in by_ch:
+                by_ch[e.channel].append(e)
+        for src_ch, dst_ch in (("L", "R"), ("R", "L")):
+            for e in by_ch[src_ch]:
+                key = (dst_ch, int(round(e.start_s * 500.0)))
+                if key in have:
+                    continue
+                # only mirror if sibling has no near hit already (±4 ms)
+                if any(abs(o.start_s - e.start_s) < 0.004 for o in by_ch[dst_ch]):
+                    continue
+                out.append(
+                    DropoutEvent(
+                        start_s=e.start_s,
+                        end_s=e.end_s,
+                        start_sample=e.start_sample,
+                        end_sample=e.end_sample,
+                        channel=dst_ch,  # type: ignore[arg-type]
+                        type="impulse_click",
+                        severity=e.severity,
+                        confidence=e.confidence,
+                        duration_class=e.duration_class,
+                        notes="linked sibling tick for dual-mono L/R balance",
+                    )
+                )
+                have.add(key)
     return out
 
 
