@@ -158,40 +158,71 @@ def build_app():
     with gr.Blocks(title="mtdrop — tape dropout tool") as demo:
         gr.Markdown(
             """
-# mtdrop — local listen UI
-Full-file detect → optional azimuth/level correct → optional repair.
+# mtdrop — interface local / local listen UI
 
-**Source WAV is never overwritten.** Derived corrected/repaired downloads keep the
-**same sample rate, bit depth, and channel count** as the input (e.g. 88.2 kHz/24-bit → 88.2/24).
+Pipeline: detect → **corrigido/corrected** (só azimuth + nível L/R) → **reparado/repaired** (resultado final: dropouts + estalos/clicks da fonte).
+
+| Faixa / Player | PT | EN |
+|---|---|---|
+| **Original** | Arquivo de entrada (pode já ter estalos) | Source WAV (may already contain ticks/pops) |
+| **Corrigido** | Só alinhamento (azimuth + ganho L/R) — **não** é o resultado final | Alignment only — **not** the final result |
+| **Reparado** | **Resultado final** (alinhamento + dropouts + de-click) | **Final output** (alignment + dropout + de-click) |
+
+**Reparo padrão = conservative (protege voz/letra).** Não substitui sílabas com fill inventado. Use `aggressive` só se o dropout for grave e você aceitar mais invasão.
+
+O WAV de origem **nunca** é sobrescrito. Saídas mantêm taxa / bits / canais do input.
             """
         )
         with gr.Row():
             inp = gr.File(label="WAV (≤192 kHz / 24-bit, mono or stereo)", file_types=[".wav"])
             with gr.Column():
-                do_correct = gr.Checkbox(value=True, label="Correct azimuth + L/R level")
+                do_correct = gr.Checkbox(
+                    value=True,
+                    label="Corrigir azimuth + nível L/R / Correct azimuth + L/R level",
+                )
                 repair_mode = gr.Radio(
-                    choices=["conservative", "off"],
+                    choices=["conservative", "aggressive", "off"],
                     value="conservative",
-                    label="Repair",
+                    label=(
+                        "Reparo / Repair — conservative = protege voz/letra (padrão); "
+                        "aggressive = mais invasivo"
+                    ),
                 )
                 sensitivity = gr.Radio(
                     choices=["balanced", "aggressive", "conservative"],
                     value="balanced",
-                    label="Sensitivity",
+                    label="Sensibilidade / Sensitivity",
                 )
-                run_btn = gr.Button("Run mtdrop", variant="primary")
+                run_btn = gr.Button("Rodar mtdrop / Run", variant="primary")
 
-        status = gr.Textbox(label="Summary", interactive=False)
-        log = gr.Textbox(label="Progress log", lines=4, interactive=False)
+        status = gr.Textbox(label="Resumo / Summary", interactive=False)
+        log = gr.Textbox(label="Log", lines=4, interactive=False)
 
-        gr.Markdown("### A / B listen (full file)")
+        gr.Markdown(
+            "### Ouça o arquivo inteiro / Full-file A–B\n"
+            "**Use REPARADO como resultado final.** Corrigido = só azimuth/nível."
+        )
         with gr.Row():
-            aud_orig = gr.Audio(label="Original", type="filepath", interactive=False)
-            aud_corr = gr.Audio(label="Corrected", type="filepath", interactive=False)
-            aud_rep = gr.Audio(label="Repaired", type="filepath", interactive=False)
+            aud_orig = gr.Audio(
+                label="1) Original (entrada / source)",
+                type="filepath",
+                interactive=False,
+            )
+            aud_corr = gr.Audio(
+                label="2) Corrigido / Corrected — só azimuth+nível (NÃO é o final)",
+                type="filepath",
+                interactive=False,
+            )
+            aud_rep = gr.Audio(
+                label="3) REPARADO / REPAIRED — resultado final ★",
+                type="filepath",
+                interactive=False,
+            )
 
-        downloads = gr.Files(label="Download derived WAVs + reports")
-        summary_json = gr.Code(label="Run summary JSON", language="json")
+        downloads = gr.Files(
+            label="Download — use o *.repaired.wav como resultado final / final deliverable"
+        )
+        summary_json = gr.Code(label="JSON do run", language="json")
 
         run_btn.click(
             run,

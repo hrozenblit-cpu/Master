@@ -88,6 +88,35 @@ def test_correct_writes_derived_wav(tmp_path: Path) -> None:
     assert applied["level"] is not None
 
 
+def test_impulse_click_detect_and_declick(tmp_path: Path) -> None:
+    """Synthetic tick in music-like noise should be detected and attenuated."""
+    sr = 44100
+    t = np.arange(int(1.0 * sr)) / sr
+    # Band-limited-ish tone + noise
+    sig = 0.15 * np.sin(2 * np.pi * 440 * t) + 0.02 * np.random.default_rng(0).standard_normal(t.size)
+    click_i = int(0.5 * sr)
+    sig[click_i] += 0.55  # single-sample pop
+    stereo = np.stack([sig, sig * 0.98], axis=1)
+    path = tmp_path / "tick.wav"
+    sf.write(str(path), stereo, sr, subtype="PCM_16")
+
+    wav = read_wav(path)
+    report = analyze(wav, DetectConfig(detect_impulse_clicks=True, impulse_abs_floor=0.05, impulse_mad_k=6.0))
+    clicks = [e for e in report.events if e.type == "impulse_click"]
+    assert clicks, "expected impulse_click detection"
+    assert any(abs(e.start_s - 0.5) < 0.01 for e in clicks)
+
+    out = tmp_path / "tick.repaired.wav"
+    result = apply_repairs(wav, report, out, mode="conservative")
+    assert any(s.get("strategy") == "declick_interp" and s.get("status") == "applied" for s in result.plan.strategies)
+    rep, _ = sf.read(str(out), always_2d=True)
+    # Peak around the click sample should drop substantially
+    w = 3
+    before = float(np.max(np.abs(stereo[click_i - w : click_i + w + 1])))
+    after = float(np.max(np.abs(rep[click_i - w : click_i + w + 1])))
+    assert after < before * 0.55
+
+
 def test_repair_applies_and_fills_hard_mute(tmp_path: Path) -> None:
     wav_path = _ensure_fixture()
     wav = read_wav(wav_path)

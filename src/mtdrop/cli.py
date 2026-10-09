@@ -148,9 +148,12 @@ def _add_analyze_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--repair",
-        choices=["off", "conservative", "preview"],
+        choices=["off", "conservative", "aggressive", "preview"],
         default="off",
-        help="Phase C: apply dropout repairs to derived *.repaired.wav (conservative|preview)",
+        help=(
+            "Phase C: derived *.repaired.wav — conservative=vocal-safe default; "
+            "aggressive=more invasive fills; preview=alias of aggressive"
+        ),
     )
     p.add_argument(
         "--listen-previews",

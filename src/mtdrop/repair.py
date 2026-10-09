@@ -21,19 +21,47 @@ import numpy as np
 from mtdrop.models import AnalysisReport, DropoutEvent
 from mtdrop.wav_io import WavAudio, WavFormat, channel_matrix, write_wav_matching, _subtype_bit_depth
 
-RepairMode = Literal["off", "conservative", "preview"]
+# conservative = vocal-safe default (Helio: don't chew lyrics / "comeu as palavras")
+# aggressive = more invasive fills (alias: preview, kept for CLI back-compat)
+RepairMode = Literal["off", "conservative", "aggressive", "preview"]
 
-# Duration caps (seconds). preview is slightly more permissive.
+
+def _norm_mode(mode: RepairMode) -> RepairMode:
+    if mode == "preview":
+        return "aggressive"
+    return mode
+
+
+# Duration caps (seconds). Conservative keeps replacements short so consonants survive.
 # For dual_mono_like / full-track→two-track, longer asymmetric events can still
 # borrow from the clean sibling — see _choose_strategy.
 _MAX_DUR = {
-    "conservative": {"hard_mute": 0.10, "level_dip": 0.12, "hf_loss": 0.15},
-    "preview": {"hard_mute": 0.20, "level_dip": 0.25, "hf_loss": 0.30},
+    "conservative": {"hard_mute": 0.080, "level_dip": 0.055, "hf_loss": 0.035, "impulse_click": 0.004},
+    "aggressive": {"hard_mute": 0.20, "level_dip": 0.25, "hf_loss": 0.30, "impulse_click": 0.012},
 }
 _MAX_DUR_BORROW = {
-    "conservative": {"hard_mute": 0.25, "level_dip": 0.30, "hf_loss": 0.35},
-    "preview": {"hard_mute": 0.40, "level_dip": 0.50, "hf_loss": 0.50},
+    "conservative": {"hard_mute": 0.15, "level_dip": 0.12, "hf_loss": 0.12},
+    "aggressive": {"hard_mute": 0.40, "level_dip": 0.50, "hf_loss": 0.50},
 }
+# Floor for *apply* (detection may still list milder markers).
+# Conservative is intentionally high — prefer markers over inventing syllables.
+_MIN_SEVERITY = {
+    # level_dip 0.72 keeps pior.wav real holes; apply-time content gate blocks voiced FPs
+    "conservative": {"hard_mute": 0.55, "level_dip": 0.72, "hf_loss": 0.92, "impulse_click": 0.60},
+    "aggressive": {"hard_mute": 0.40, "level_dip": 0.60, "hf_loss": 0.82, "impulse_click": 0.48},
+}
+# Skip micro repairs that only create edge clicks (seconds).
+# impulse_click is intentionally sub-ms…few-ms — do not treat as skip_micro.
+_MIN_APPLY_DUR = {
+    "conservative": {"hard_mute": 0.003, "level_dip": 0.008, "hf_loss": 0.025, "impulse_click": 0.00015},
+    "aggressive": {"hard_mute": 0.003, "level_dip": 0.005, "hf_loss": 0.015, "impulse_click": 0.0001},
+}
+# Merge same-channel planned spans closer than this (seconds).
+_MERGE_GAP_S = {"conservative": 0.040, "aggressive": 0.020}
+# Cap unique dropout time-spans per second of audio (keep highest severity).
+_MAX_SPANS_PER_S = {"conservative": 0.6, "aggressive": 2.0}
+# Max fraction of fill vs original for non-mute strategies (vocal safety).
+_MAX_NEW_BLEND = {"conservative": 0.45, "aggressive": 0.95}
 
 
 @dataclass(slots=True)
@@ -93,30 +121,113 @@ def plan_repairs(
             message="repair off",
         )
 
+    mode = _norm_mode(mode)
     caps = _MAX_DUR[mode]
     borrow_caps = _MAX_DUR_BORROW[mode]
+    sev_floor = _MIN_SEVERITY[mode]
+    dur_floor = _MIN_APPLY_DUR[mode]
+    merge_gap = _MERGE_GAP_S[mode]
     dual_mono = report.stereo_relationship == "dual_mono_like"
     selected: list[DropoutEvent] = []
     strategies: list[dict[str, Any]] = []
     deferred = 0
 
-    # Repair only per-channel morphology events (avoid double-hit on joint overlays).
+    # Per-channel morphology + source impulse clicks (ticks/pops in the transfer).
     candidates = [
         e
         for e in report.events
-        if e.type in {"level_dip", "hard_mute", "hf_loss"} and e.channel in {"L", "R", "mono"}
+        if e.type in {"level_dip", "hard_mute", "hf_loss", "impulse_click"}
+        and e.channel in {"L", "R", "mono"}
     ]
-    # Longest-first so we can skip nested overlaps on same channel
-    candidates.sort(key=lambda e: (-e.duration_s, e.start_sample, e.channel))
+    # Strongest / longest first so weak dense HF hits yield to real dropouts.
+    candidates.sort(key=lambda e: (-e.severity, -e.duration_s, e.start_sample, e.channel))
     claimed: list[tuple[str, int, int]] = []
 
     for ev in candidates:
-        if _overlaps_claimed(ev, claimed):
-            strategies.append(_strat(ev, "skip_overlap", "planned", reason="overlaps larger event"))
+        min_sev = sev_floor.get(ev.type, 0.7)
+        if ev.severity < min_sev:
+            strategies.append(
+                _strat(ev, "skip_mild", "deferred", reason=f"severity {ev.severity:.3f} < {min_sev:.2f}")
+            )
             deferred += 1
             continue
 
-        strat = _choose_strategy(ev, report)
+        min_d = dur_floor.get(ev.type, 0.008)
+        if ev.duration_s < min_d:
+            strategies.append(
+                _strat(ev, "skip_micro", "deferred", reason=f"duration {ev.duration_s*1000:.1f}ms < {min_d*1000:.0f}ms")
+            )
+            deferred += 1
+            continue
+
+        if _overlaps_claimed(ev, claimed, merge_gap_s=merge_gap, sr=report.sample_rate):
+            strategies.append(
+                _strat(ev, "skip_overlap", "deferred", reason="overlaps / within merge gap of stronger event")
+            )
+            deferred += 1
+            continue
+
+        strat = _choose_strategy(ev, report, mode=mode)
+        if strat == "defer_bilateral_hf":
+            strategies.append(
+                _strat(
+                    ev,
+                    "defer_bilateral_hf",
+                    "deferred",
+                    reason="bilateral HF on dual_mono — skip splice (markers only; avoids music clicks)",
+                )
+            )
+            deferred += 1
+            continue
+
+        # Conservative / vocal-safe: never invent bilateral STFT/context (eats consonants).
+        # Downgrade to short cubic soft-blend instead of full bilateral_context.
+        if mode == "conservative" and strat == "bilateral_context":
+            if ev.type == "hard_mute" or (ev.severity >= 0.72 and ev.duration_s <= 0.055):
+                strat = "cubic_interp"
+            else:
+                strategies.append(
+                    _strat(
+                        ev,
+                        "defer_bilateral_vocal",
+                        "deferred",
+                        reason="conservative vocal-safe: no bilateral full-band fill (use markers / aggressive)",
+                    )
+                )
+                deferred += 1
+                continue
+
+        # Bilateral full-band fills invent crackle unless the dip is strong + short.
+        if strat == "bilateral_context":
+            if ev.severity < 0.78 or ev.duration_s > 0.080:
+                strategies.append(
+                    _strat(
+                        ev,
+                        "defer_bilateral_risky",
+                        "deferred",
+                        reason=(
+                            f"bilateral fill needs sev≥0.78 and dur≤80ms "
+                            f"(got sev={ev.severity:.2f}, dur={ev.duration_s*1000:.0f}ms)"
+                        ),
+                    )
+                )
+                deferred += 1
+                continue
+
+        # Conservative: skip STFT / HF reconstruct — they replace voiced texture.
+        if mode == "conservative" and strat in {"stft_interp", "hf_band_reconstruct"}:
+            if strat == "hf_band_reconstruct" or ev.type != "hard_mute":
+                strategies.append(
+                    _strat(
+                        ev,
+                        "defer_spectral_vocal",
+                        "deferred",
+                        reason="conservative vocal-safe: no STFT/HF replace (keeps syllables)",
+                    )
+                )
+                deferred += 1
+                continue
+
         # Full-track→two-track / dual-mono: allow longer repairs when borrowing from clean sibling
         max_d = borrow_caps.get(ev.type, 0.25) if strat == "cross_channel_borrow" else caps.get(ev.type, 0.08)
         if ev.duration_s > max_d:
@@ -128,6 +239,8 @@ def plan_repairs(
 
         if dual_mono and strat == "cross_channel_borrow":
             notes_extra = "dual_mono_like prefer borrow"
+        elif mode == "conservative":
+            notes_extra = "vocal-safe conservative"
         else:
             notes_extra = ""
         selected.append(ev)
@@ -136,6 +249,12 @@ def plan_repairs(
             s["note"] = notes_extra
         strategies.append(s)
         claimed.append((ev.channel, ev.start_sample, ev.end_sample))
+
+    # Density throttle on dropout splices only (impulse de-clicks are tiny + must stay).
+    selected, strategies, extra_def = _throttle_density(
+        selected, strategies, report.frames / max(1, report.sample_rate), mode=mode
+    )
+    deferred += extra_def
 
     return RepairPlan(
         mode=mode,
@@ -161,10 +280,12 @@ def apply_repairs(
         plan = plan_repairs(report, mode=mode)
         return RepairResult(plan=plan, samples=channel_matrix(wav.samples), sample_rate=wav.sample_rate)
 
+    mode = _norm_mode(mode)
     plan = plan_repairs(report, mode=mode)
     x = channel_matrix(wav.samples).astype(np.float64, copy=True)
     sr = wav.sample_rate
     applied: list[dict[str, Any]] = []
+    max_new = _MAX_NEW_BLEND[mode]
 
     # Apply shortest-first within planned set for cleaner edge context
     order = sorted(plan.events_selected, key=lambda e: (e.start_sample, e.duration_s))
@@ -174,7 +295,7 @@ def apply_repairs(
 
     for ev in order:
         key = (ev.start_sample, ev.channel, ev.type)
-        meta = strat_by_key.get(key) or _strat(ev, _choose_strategy(ev, report), "planned")
+        meta = strat_by_key.get(key) or _strat(ev, _choose_strategy(ev, report, mode=mode), "planned")
         strategy = meta["strategy"]
         ch_i = _channel_index(ev.channel, x.shape[1])
         if ch_i is None:
@@ -190,18 +311,41 @@ def apply_repairs(
             meta["reason"] = "empty span"
             continue
 
+        # Vocal / music preservation: don't replace spans that still carry energy
+        # (partial dips / consonants) unless hard_mute or impulse tick.
+        if (
+            mode == "conservative"
+            and ev.type in {"level_dip", "hf_loss"}
+            and strategy != "cross_channel_borrow"
+            and not _is_true_dropout_span(x[:, ch_i], a, b, max_ratio=0.22)
+        ):
+            meta["status"] = "deferred"
+            meta["strategy"] = "defer_has_content"
+            meta["reason"] = "span still has energy — skip replace (protect voiced content)"
+            plan.deferred_count += 1
+            continue
+
         try:
-            if strategy == "cross_channel_borrow":
+            if strategy == "declick_interp":
+                # De-click may be stronger than dropout fills — ticks aren't lyrics.
+                _declick_interp(
+                    x[:, ch_i], a, b, sr, max_new=0.85 if mode == "conservative" else 0.95
+                )
+            elif strategy == "cross_channel_borrow":
                 donor = 1 - ch_i
-                _cross_channel_borrow(x, ch_i, donor, a, b)
+                # Borrow is safer for vocals (real donor audio) — allow more replacement.
+                borrow_new = min(1.0, max_new + 0.35) if mode == "conservative" else max_new
+                _cross_channel_borrow(x, ch_i, donor, a, b, sr, max_new=borrow_new)
             elif strategy == "hf_band_reconstruct":
                 _hf_band_reconstruct(x[:, ch_i], a, b, sr)
             elif strategy == "bilateral_context":
-                _bilateral_context_fill(x[:, ch_i], a, b)
+                _bilateral_context_fill(x[:, ch_i], a, b, sr)
             elif strategy == "stft_interp":
-                _stft_interp(x[:, ch_i], a, b)
-            else:  # cubic_interp / mirror
-                _mirror_interp(x[:, ch_i], a, b)
+                _stft_interp(x[:, ch_i], a, b, sr=sr)
+            else:  # cubic_interp / mirror — keep soft on level dips (lyrics)
+                fill_new = 0.30 if (mode == "conservative" and ev.type == "level_dip") else max_new
+                _mirror_interp(x[:, ch_i], a, b, sr=sr, max_new=fill_new)
+            _seal_boundaries(x[:, ch_i], a, b, sr)
             meta["status"] = "applied"
             applied.append(
                 {
@@ -291,28 +435,121 @@ def _strat(ev: DropoutEvent, strategy: str, status: str, reason: str = "") -> di
     return d
 
 
-def _overlaps_claimed(ev: DropoutEvent, claimed: list[tuple[str, int, int]]) -> bool:
+def _overlaps_claimed(
+    ev: DropoutEvent,
+    claimed: list[tuple[str, int, int]],
+    *,
+    merge_gap_s: float = 0.0,
+    sr: int = 48000,
+) -> bool:
+    pad = int(round(max(0.0, merge_gap_s) * sr))
     for ch, a, b in claimed:
         if ch != ev.channel:
             continue
-        if ev.start_sample < b and ev.end_sample > a:
+        if ev.start_sample < b + pad and ev.end_sample + pad > a:
             return True
     return False
 
 
-def _choose_strategy(ev: DropoutEvent, report: AnalysisReport) -> str:
+def _throttle_density(
+    selected: list[DropoutEvent],
+    strategies: list[dict[str, Any]],
+    duration_s: float,
+    *,
+    mode: RepairMode,
+) -> tuple[list[DropoutEvent], list[dict[str, Any]], int]:
+    """Keep at most N unique dropout time-spans per second (impulse clicks exempt)."""
+    if not selected or duration_s <= 0:
+        return selected, strategies, 0
+    clicks = [e for e in selected if e.type == "impulse_click"]
+    drops = [e for e in selected if e.type != "impulse_click"]
+    if not drops:
+        return selected, strategies, 0
+    max_spans = max(3, int(round(_MAX_SPANS_PER_S[mode] * duration_s)))
+    # Group by approximate start (10 ms bins) ignoring channel — L+R same hit counts once.
+    bins: dict[int, list[DropoutEvent]] = {}
+    for ev in drops:
+        key = int(round(ev.start_s * 100.0))  # 10 ms
+        bins.setdefault(key, []).append(ev)
+    ranked = sorted(bins.items(), key=lambda kv: -max(e.severity for e in kv[1]))
+    keep_keys = {k for k, _ in ranked[:max_spans]}
+    if len(keep_keys) >= len(bins):
+        return selected, strategies, 0
+
+    keep_ids = {(e.start_sample, e.channel, e.type) for k in keep_keys for e in bins[k]}
+    # Always keep impulse clicks
+    keep_ids |= {(e.start_sample, e.channel, e.type) for e in clicks}
+    new_selected = [e for e in selected if (e.start_sample, e.channel, e.type) in keep_ids]
+    deferred = 0
+    for s in strategies:
+        if s.get("status") != "planned":
+            continue
+        if s.get("type") == "impulse_click":
+            continue
+        key = (s.get("start_sample"), s.get("channel"), s.get("type"))
+        if key not in keep_ids:
+            s["status"] = "deferred"
+            s["strategy"] = "skip_density"
+            s["reason"] = f"density cap ~{_MAX_SPANS_PER_S[mode]:.1f} spans/s"
+            deferred += 1
+    return new_selected, strategies, deferred
+
+
+def _choose_strategy(ev: DropoutEvent, report: AnalysisReport, *, mode: RepairMode = "conservative") -> str:
+    mode = _norm_mode(mode)
+    if ev.type == "impulse_click":
+        return "declick_interp"
     dual_mono = report.stereo_relationship == "dual_mono_like"
     # Full-track mono→two-track / dual-mono: prefer cross-channel borrow whenever donor is usable.
     if ev.channel in {"L", "R"} and _donor_usable(ev, report, dual_mono=dual_mono):
         return "cross_channel_borrow"
+    # Bilateral HF clog on dual-mono: full-band bilateral fill invents LF clicks in music.
+    # Mark for defer — markers stay in dropouts.json; do not splice.
+    if (
+        dual_mono
+        and ev.type == "hf_loss"
+        and ev.channel in {"L", "R"}
+        and _bilateral_damage(ev, report)
+    ):
+        return "defer_bilateral_hf"
     if ev.type == "hf_loss":
         return "hf_band_reconstruct"
-    # Bilateral damage (common on full-track debris): long context fill beats short STFT.
-    if dual_mono and ev.channel in {"L", "R"} and _bilateral_damage(ev, report):
+    # Bilateral level damage (debris): long context fill beats short STFT.
+    # (Conservative plan_repairs will defer this for vocal safety.)
+    if (
+        dual_mono
+        and ev.type in {"level_dip", "hard_mute"}
+        and ev.channel in {"L", "R"}
+        and _bilateral_damage(ev, report)
+    ):
         return "bilateral_context"
+    # Vocal-safe: prefer short cubic over STFT (STFT replaces consonants).
+    if mode == "conservative" or ev.duration_s < 0.012:
+        return "cubic_interp"
     if ev.duration_s >= 0.012:
         return "stft_interp"
     return "cubic_interp"
+
+
+def _is_true_dropout_span(ch: np.ndarray, a: int, b: int, *, max_ratio: float = 0.22) -> bool:
+    """True when [a:b) is much quieter than neighbors — safe to replace.
+
+    Partial dips that still hold voiced/musical energy return False so we don't
+    chew consonants/syllables (Helio: “comeu um pouco as palavras” @ ~1:15).
+    """
+    n = b - a
+    if n <= 0 or ch.size < 8:
+        return False
+    ctx = max(n, min(2048, n * 4))
+    left = ch[max(0, a - ctx) : a]
+    right = ch[b : min(ch.size, b + ctx)]
+    if left.size < 8 and right.size < 8:
+        return True
+    span_rms = float(np.sqrt(np.mean(ch[a:b] ** 2) + 1e-20))
+    neigh = np.concatenate([left, right]) if left.size and right.size else (left if left.size else right)
+    neigh_rms = float(np.sqrt(np.mean(neigh**2) + 1e-20))
+    # Require deep hole: default ≤ ~22% of neighbor (~−13 dB)
+    return span_rms <= neigh_rms * max_ratio
 
 
 def _bilateral_damage(ev: DropoutEvent, report: AnalysisReport) -> bool:
@@ -363,17 +600,135 @@ def _channel_index(tag: str, n_ch: int) -> int | None:
     return None
 
 
+def _declick_interp(ch: np.ndarray, a: int, b: int, sr: int, *, max_new: float = 0.9) -> None:
+    """Remove a short source tick/pop by cubic-ish mirror fill + equal-power crossfade."""
+    n = b - a
+    if n <= 0:
+        return
+    left = float(ch[a - 1]) if a > 0 else float(ch[a])
+    right = float(ch[b]) if b < ch.size else float(ch[b - 1])
+    t = np.linspace(0.0, 1.0, n)
+    w = t * t * (3.0 - 2.0 * t)
+    bridge = (1.0 - w) * left + w * right
+    if n >= 8:
+        ctx = max(16, min(128, n * 3))
+        left_ctx = ch[max(0, a - ctx) : a]
+        right_ctx = ch[b : min(ch.size, b + ctx)]
+        if left_ctx.size and right_ctx.size:
+            from_l = _tile_to(left_ctx[::-1], n)
+            from_r = _tile_to(right_ctx[::-1], n)
+            tex = from_l * np.cos(0.5 * np.pi * t) + from_r * np.sin(0.5 * np.pi * t)
+            fill = 0.65 * bridge + 0.35 * tex
+        else:
+            fill = bridge
+    else:
+        fill = bridge
+    fill = _match_endpoints(fill, left, right)
+    fade = max(1, min(n // 3, int(round(sr * 0.0004))))
+    w_new, w_old = _fade_weights(n, fade)
+    # Cap replacement strength — conservative keeps more original around vocals
+    strength = float(np.clip(max_new, 0.2, 1.0))
+    w_new = np.clip(w_new, 0.0, 1.0) * strength
+    # Boost center of the tick a bit more than edges
+    mid = np.sin(np.pi * t) ** 2
+    w_new = np.clip(w_new + 0.25 * mid * strength, 0.0, strength)
+    w_old = 1.0 - w_new
+    ch[a:b] = w_new * fill + w_old * ch[a:b]
+
+
+def _fade_len(n: int, sr: int, ms: float = 8.0) -> int:
+    """Crossfade length in samples — long enough to avoid audible clicks in music."""
+    if n <= 2:
+        return 1
+    want = int(round(sr * ms / 1000.0))
+    # At least ~3 ms, at most 40% of the span (need room for both edges)
+    lo = max(32, int(round(sr * 0.003)))
+    hi = max(lo, int(n * 0.4))
+    return int(np.clip(want, lo, hi))
+
+
 def _fade_weights(n: int, fade: int) -> tuple[np.ndarray, np.ndarray]:
+    """Equal-power (cosine) edge fades — linear ramps cause clicks on bright music."""
     fade = max(1, min(fade, n // 2 if n >= 2 else 1))
     w_new = np.ones(n, dtype=np.float64)
-    if n >= 2:
-        ramp = np.linspace(0.0, 1.0, fade)
-        w_new[:fade] = ramp
-        w_new[-fade:] = ramp[::-1]
+    if n >= 2 and fade >= 1:
+        # raised-cosine / equal-power: sin^2 in, cos^2 out
+        t = np.linspace(0.0, 1.0, fade, endpoint=True)
+        ramp_in = np.sin(0.5 * np.pi * t) ** 2
+        w_new[:fade] = ramp_in
+        w_new[-fade:] = ramp_in[::-1]
     return w_new, 1.0 - w_new
 
 
-def _mirror_interp(ch: np.ndarray, a: int, b: int, ctx: int = 128) -> None:
+def _match_endpoints(fill: np.ndarray, left: float, right: float) -> np.ndarray:
+    """Affine-correct fill so first/last samples match neighbors (kills step discontinuities)."""
+    if fill.size == 0:
+        return fill
+    if fill.size == 1:
+        return np.array([(left + right) * 0.5], dtype=np.float64)
+    out = fill.astype(np.float64, copy=True)
+    # Remove linear trend between endpoints, then re-add target endpoints
+    t = np.linspace(0.0, 1.0, out.size)
+    old_l, old_r = float(out[0]), float(out[-1])
+    out = out - ((1.0 - t) * old_l + t * old_r)
+    out = out + ((1.0 - t) * left + t * right)
+    return out
+
+
+def _seal_boundaries(ch: np.ndarray, a: int, b: int, sr: int) -> None:
+    """Post-repair micro-crossfade around event edges to kill residual clicks/pops."""
+    n = ch.size
+    if n < 4 or b <= a:
+        return
+    fade = _fade_len(max(8, b - a), sr, ms=4.0)
+    # Blend a short neighborhood straddling each edge back toward continuity
+    for edge in (a, b):
+        lo = max(0, edge - fade)
+        hi = min(n, edge + fade)
+        if hi - lo < 4:
+            continue
+        # Local linear bridge across the edge neighborhood
+        left = float(ch[lo])
+        right = float(ch[hi - 1])
+        t = np.linspace(0.0, 1.0, hi - lo)
+        bridge = (1.0 - t) * left + t * right
+        # Equal-power mix: keep most of signal, pull edges toward bridge
+        w = np.sin(np.pi * t) ** 2  # peaks at center/edge
+        # Stronger correction right at the boundary index
+        mid = edge - lo
+        w = np.clip(w * 0.35, 0.0, 0.35)
+        if 0 <= mid < w.size:
+            w[mid] = min(0.55, w[mid] + 0.25)
+        ch[lo:hi] = (1.0 - w) * ch[lo:hi] + w * bridge
+
+
+def _blend_fill(
+    ch: np.ndarray,
+    a: int,
+    b: int,
+    fill: np.ndarray,
+    sr: int,
+    ms: float = 8.0,
+    *,
+    max_new: float = 1.0,
+) -> None:
+    n = b - a
+    if n <= 0 or fill.size != n:
+        return
+    left = float(ch[a - 1]) if a > 0 else float(fill[0])
+    right = float(ch[b]) if b < ch.size else float(fill[-1])
+    fill = _match_endpoints(fill, left, right)
+    fade = _fade_len(n, sr, ms=ms)
+    w_new, w_old = _fade_weights(n, fade)
+    strength = float(np.clip(max_new, 0.0, 1.0))
+    w_new = w_new * strength
+    w_old = 1.0 - w_new
+    ch[a:b] = w_new * fill + w_old * ch[a:b]
+
+
+def _mirror_interp(
+    ch: np.ndarray, a: int, b: int, ctx: int = 128, sr: int = 48000, *, max_new: float = 1.0
+) -> None:
     """Replace [a:b) with crossfade of mirrored left/right context (cubic_interp family)."""
     n = b - a
     if n <= 0:
@@ -391,16 +746,11 @@ def _mirror_interp(ch: np.ndarray, a: int, b: int, ctx: int = 128) -> None:
         from_l = _tile_to(left[::-1], n)
         from_r = _tile_to(right[::-1], n)
         t = np.linspace(0.0, 1.0, n)
-        # Equal-power-ish crossfade
         fill = from_l * np.cos(0.5 * np.pi * t) + from_r * np.sin(0.5 * np.pi * t)
-    # Match edge samples exactly
-    if a > 0:
-        fill = fill - fill[0] + ch[a - 1]
-    w_new, w_old = _fade_weights(n, max(8, min(64, n // 4)))
-    ch[a:b] = w_new * fill + w_old * ch[a:b]
+    _blend_fill(ch, a, b, fill, sr, ms=10.0, max_new=max_new)
 
 
-def _bilateral_context_fill(ch: np.ndarray, a: int, b: int) -> None:
+def _bilateral_context_fill(ch: np.ndarray, a: int, b: int, sr: int = 48000) -> None:
     """Longer-context fill for dual-mono bilateral dropouts (both channels damaged).
 
     Cross-channel borrow is unavailable; use extended mirror from each side of the
@@ -410,17 +760,17 @@ def _bilateral_context_fill(ch: np.ndarray, a: int, b: int) -> None:
     if n <= 0:
         return
     ctx = max(256, min(2048, n * 4))
-    _mirror_interp(ch, a, b, ctx=ctx)
+    _mirror_interp(ch, a, b, ctx=ctx, sr=sr)
     # Refine with STFT if gap is long enough for a stable transform
     if n >= 64:
         backup = ch[a:b].copy()
         try:
-            _stft_interp(ch, a, b, n_fft=min(512, 1 << int(np.ceil(np.log2(max(64, n))))), hop=64)
-            # Blend mirror (transient continuity) with STFT (tonal fill)
+            _stft_interp(ch, a, b, sr=sr, n_fft=min(512, 1 << int(np.ceil(np.log2(max(64, n))))), hop=64)
+            # Prefer mirror at edges (continuity), STFT in the middle (tonal)
             t = np.linspace(0.0, 1.0, n)
-            # Prefer mirror at edges, STFT in the middle
             w_stft = np.sin(np.pi * t) ** 2
             ch[a:b] = (1.0 - w_stft) * backup + w_stft * ch[a:b]
+            _seal_boundaries(ch, a, b, sr)
         except Exception:  # noqa: BLE001
             ch[a:b] = backup
 
@@ -432,7 +782,9 @@ def _tile_to(seg: np.ndarray, n: int) -> np.ndarray:
     return np.tile(seg, reps)[:n].astype(np.float64)
 
 
-def _cross_channel_borrow(x: np.ndarray, target: int, donor: int, a: int, b: int) -> None:
+def _cross_channel_borrow(
+    x: np.ndarray, target: int, donor: int, a: int, b: int, sr: int = 48000, *, max_new: float = 1.0
+) -> None:
     n = b - a
     ctx = min(256, a, x.shape[0] - b)
     src = x[a:b, donor].copy()
@@ -441,19 +793,18 @@ def _cross_channel_borrow(x: np.ndarray, target: int, donor: int, a: int, b: int
     don_ctx = np.concatenate([x[max(0, a - ctx) : a, donor], x[b : min(x.shape[0], b + ctx), donor]])
     rms_t = float(np.sqrt(np.mean(tgt_ctx**2) + 1e-20)) if tgt_ctx.size else 1.0
     rms_d = float(np.sqrt(np.mean(don_ctx**2) + 1e-20)) if don_ctx.size else 1.0
-    scaled = src * (rms_t / rms_d)
-    w_new, w_old = _fade_weights(n, max(8, min(64, n // 4)))
-    x[a:b, target] = w_new * scaled + w_old * x[a:b, target]
+    scaled = src * (rms_t / max(rms_d, 1e-12))
+    _blend_fill(x[:, target], a, b, scaled, sr, ms=10.0, max_new=max_new)
 
 
-def _stft_interp(ch: np.ndarray, a: int, b: int, n_fft: int = 512, hop: int = 128) -> None:
+def _stft_interp(ch: np.ndarray, a: int, b: int, sr: int = 48000, n_fft: int = 512, hop: int = 128) -> None:
     """Interpolate STFT frames across the gap; overlap-add back into ch[a:b]."""
     pad = n_fft * 2
     start = max(0, a - pad)
     end = min(ch.size, b + pad)
     seg = ch[start:end].copy()
     if seg.size < n_fft:
-        _mirror_interp(ch, a, b)
+        _mirror_interp(ch, a, b, sr=sr)
         return
 
     window = np.hanning(n_fft).astype(np.float64)
@@ -477,7 +828,7 @@ def _stft_interp(ch: np.ndarray, a: int, b: int, n_fft: int = 512, hop: int = 12
     if not bad:
         return
     if not good:
-        _mirror_interp(ch, a, b)
+        _mirror_interp(ch, a, b, sr=sr)
         return
 
     mags = np.abs(specs)
@@ -512,22 +863,18 @@ def _stft_interp(ch: np.ndarray, a: int, b: int, n_fft: int = 512, hop: int = 12
     norm = np.maximum(norm, 1e-8)
     recon = out / norm
 
-    # Only write the gap region back (with short fade)
-    ga, gb = gap_a, gap_b
-    fill = recon[ga:gb]
-    n = fill.size
-    w_new, w_old = _fade_weights(n, max(8, min(64, n // 4)))
-    ch[a:b] = w_new * fill + w_old * ch[a:b]
+    fill = recon[gap_a:gap_b]
+    _blend_fill(ch, a, b, fill, sr, ms=10.0)
 
 
 def _hf_band_reconstruct(ch: np.ndarray, a: int, b: int, sr: int, n_fft: int = 512, hop: int = 128) -> None:
-    """Keep LF from the dip region; rebuild HF from neighboring frames."""
+    """Keep LF + local phase; rebuild HF magnitude from neighbors (phase swap → clicks)."""
     pad = n_fft * 2
     start = max(0, a - pad)
     end = min(ch.size, b + pad)
     seg = ch[start:end].copy()
     if seg.size < n_fft:
-        _mirror_interp(ch, a, b)
+        _mirror_interp(ch, a, b, sr=sr)
         return
 
     window = np.hanning(n_fft).astype(np.float64)
@@ -554,29 +901,26 @@ def _hf_band_reconstruct(ch: np.ndarray, a: int, b: int, sr: int, n_fft: int = 5
             bad.append(i)
 
     if not bad or not good:
-        _mirror_interp(ch, a, b)
+        _mirror_interp(ch, a, b, sr=sr)
         return
 
     mags = np.abs(specs)
-    phases = np.angle(specs)
+    phases = np.angle(specs)  # keep local phase — interpolated donor phase causes estalos
     for i in bad:
         left = max((g for g in good if g < i), default=None)
         right = min((g for g in good if g > i), default=None)
         if left is None and right is None:
             continue
         if left is None:
-            donor_mag, donor_phase = mags[right], phases[right]
+            donor_mag = mags[right]
         elif right is None:
-            donor_mag, donor_phase = mags[left], phases[left]
+            donor_mag = mags[left]
         else:
             t = (i - left) / max(1, right - left)
             donor_mag = (1 - t) * mags[left] + t * mags[right]
-            donor_phase = (1 - t) * phases[left] + t * phases[right]
-        # Keep LF from current (dulled) frame; replace HF (+ blend mid)
-        mags[i, hf_bins] = donor_mag[hf_bins]
-        phases[i, hf_bins] = donor_phase[hf_bins]
-        mags[i, mid_bins] = 0.4 * mags[i, mid_bins] + 0.6 * donor_mag[mid_bins]
-        phases[i, mid_bins] = 0.4 * phases[i, mid_bins] + 0.6 * donor_phase[mid_bins]
+        # Soft HF lift toward donor (never hard-replace); keep mid mostly local
+        mags[i, hf_bins] = 0.35 * mags[i, hf_bins] + 0.65 * donor_mag[hf_bins]
+        mags[i, mid_bins] = 0.7 * mags[i, mid_bins] + 0.3 * donor_mag[mid_bins]
 
     specs_new = mags * np.exp(1j * phases)
     out = np.zeros(seg.size, dtype=np.float64)
@@ -588,6 +932,4 @@ def _hf_band_reconstruct(ch: np.ndarray, a: int, b: int, sr: int, n_fft: int = 5
         norm[fa : fa + n_fft] += window**2
     recon = out / np.maximum(norm, 1e-8)
     fill = recon[gap_a:gap_b]
-    n = fill.size
-    w_new, w_old = _fade_weights(n, max(8, min(64, n // 4)))
-    ch[a:b] = w_new * fill + w_old * ch[a:b]
+    _blend_fill(ch, a, b, fill, sr, ms=12.0)

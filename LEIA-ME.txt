@@ -38,3 +38,9 @@ PROBLEMAS COMUNS
 O arquivo WAV original NUNCA e sobrescrito.
 Saidas corrigidas/reparadas mantem a mesma taxa, bits e canais
 do arquivo de entrada (ex.: 88.2 kHz/24-bit -> 88.2/24).
+
+REPARO PADRAO
+-------------
+O modo conservative (padrao na UI) protege voz/letra: so preenche
+mudos/dips profundos e estalos curtos. Use aggressive so se o dropout
+for grave e voce aceitar fills mais invasivos.

@@ -39,6 +39,21 @@ class DetectConfig:
     severity_threshold: float = 0.22
     # Correlation floor for dual_mono_like hint (full-track mono→two-track often ~0.90–0.98).
     dual_mono_corr: float = 0.90
+    # Source impulse clicks/ticks/pops (not tape dropouts) — sample-accurate.
+    # Tuned on Helio Samba ``15022_02_QG_do_Samba_OK.wav`` (~0:25 and similar).
+    detect_impulse_clicks: bool = True
+    # |sample − linear neighbors| must exceed this × local MAD.
+    impulse_mad_k: float = 7.0
+    # Absolute residual floor (full-scale) so quiet sections don't flood.
+    impulse_abs_floor: float = 0.007
+    # Half-width of repair pad around peak (seconds).
+    impulse_pad_s: float = 0.0009
+    # Max merged click length (seconds); longer → not a tick.
+    impulse_max_dur_s: float = 0.006
+    # Min severity to keep an impulse_click event.
+    impulse_severity_threshold: float = 0.48
+    # Hard cap per file (time-stratified keep) — avoids over-splicing bright music.
+    impulse_max_events: int = 200
 
 
 SENSITIVITY_PRESETS: dict[str, dict[str, float]] = {
@@ -146,7 +161,61 @@ def analyze(wav: WavAudio, config: DetectConfig | None = None) -> AnalysisReport
         events.extend(_stereo_report(per_ch_dips[0], per_ch_dips[1], hop, sr, cfg))
         relationship, corr = _stereo_relationship(x[:, 0], x[:, 1], cfg.dual_mono_corr)
 
-    events = [e for e in events if e.severity >= cfg.severity_threshold and e.duration_s >= cfg.min_duration_s]
+    if cfg.detect_impulse_clicks:
+        events.extend(_detect_impulse_clicks(x, sr, cfg))
+
+    kept: list[DropoutEvent] = []
+    impulses: list[DropoutEvent] = []
+    for e in events:
+        if e.type == "impulse_click":
+            if e.severity >= cfg.impulse_severity_threshold:
+                impulses.append(e)
+            continue
+        if e.severity >= cfg.severity_threshold and e.duration_s >= cfg.min_duration_s:
+            kept.append(e)
+    if len(impulses) > cfg.impulse_max_events:
+        # Time-stratified keep (1 s buckets): strongest local ticks first, then global fill.
+        # Avoids dropping real ticks near 0:25 when earlier music has many bright peaks.
+        bucket_s = 1.0
+        by_bucket: dict[int, list[DropoutEvent]] = {}
+        for e in impulses:
+            by_bucket.setdefault(int(e.start_s // bucket_s), []).append(e)
+        chosen: list[DropoutEvent] = []
+        # ~2–3 per second keeps coverage across the timeline
+        per_bucket = max(2, cfg.impulse_max_events // max(1, int(len(by_bucket) * 1.2)))
+        for _b, group in sorted(by_bucket.items()):
+            group.sort(key=lambda e: -e.severity)
+            chosen.extend(group[:per_bucket])
+        if len(chosen) < cfg.impulse_max_events:
+            rest = sorted(impulses, key=lambda e: -e.severity)
+            seen = {(e.start_sample, e.channel) for e in chosen}
+            for e in rest:
+                key = (e.start_sample, e.channel)
+                if key in seen:
+                    continue
+                chosen.append(e)
+                seen.add(key)
+                if len(chosen) >= cfg.impulse_max_events:
+                    break
+        else:
+            # Too many from buckets — trim by severity but keep ≥1 per occupied second
+            chosen.sort(key=lambda e: -e.severity)
+            keep: list[DropoutEvent] = []
+            seen_b: set[int] = set()
+            for e in chosen:
+                b = int(e.start_s // bucket_s)
+                if b not in seen_b:
+                    keep.append(e)
+                    seen_b.add(b)
+            for e in chosen:
+                if len(keep) >= cfg.impulse_max_events:
+                    break
+                if e in keep:
+                    continue
+                keep.append(e)
+            chosen = keep[: cfg.impulse_max_events]
+        impulses = chosen[: cfg.impulse_max_events]
+    events = kept + impulses
     events.sort(key=lambda e: (e.start_sample, e.channel, e.type))
 
     return AnalysisReport(
@@ -222,6 +291,118 @@ def _resample_frames(x: np.ndarray, target: int) -> np.ndarray:
     xp = np.linspace(0.0, 1.0, x.size)
     fp = np.linspace(0.0, 1.0, target)
     return np.interp(fp, xp, x)
+
+
+def _detect_impulse_clicks(x: np.ndarray, sr: int, cfg: DetectConfig) -> list[DropoutEvent]:
+    """Find source ticks/pops via residual vs local linear prediction (neighbors).
+
+    Calibrated on Helio ``15022_02_QG_do_Samba_OK.wav`` (~0:25 and similar).
+    These are *in the transfer*, not invented by repair — Master Tool should remove them.
+    """
+    n_ch = x.shape[1]
+    out: list[DropoutEvent] = []
+    for ch_i in range(n_ch):
+        tag: ChannelTag = "mono" if n_ch == 1 else ("L" if ch_i == 0 else "R")
+        out.extend(_impulse_clicks_channel(x[:, ch_i], sr, cfg, tag))
+    return out
+
+
+def _impulse_clicks_channel(
+    ch: np.ndarray, sr: int, cfg: DetectConfig, channel: ChannelTag
+) -> list[DropoutEvent]:
+    n = int(ch.size)
+    if n < 32:
+        return []
+    # Residual vs linear interp from ±1 sample (= |2nd difference|/2)
+    err = np.abs(ch - 0.5 * (np.roll(ch, 1) + np.roll(ch, -1)))
+    err[0] = 0.0
+    err[-1] = 0.0
+    # Local MAD via median of |err| in ~40 ms (stride for speed)
+    win = max(64, int(0.04 * sr))
+    hop = max(16, win // 4)
+    local_mad = np.zeros(n, dtype=np.float64)
+    for i in range(0, n, hop):
+        a = max(0, i - win // 2)
+        b = min(n, a + win)
+        a = max(0, b - win)
+        med = float(np.median(err[a:b]))
+        mad = float(np.median(np.abs(err[a:b] - med))) + 1e-12
+        local_mad[i : min(n, i + hop)] = mad
+    # fill any trailing zeros
+    if local_mad[-1] == 0:
+        local_mad[local_mad == 0] = float(np.median(local_mad[local_mad > 0])) if np.any(local_mad > 0) else 1e-6
+
+    thr = np.maximum(cfg.impulse_mad_k * local_mad, cfg.impulse_abs_floor)
+    peaks = np.where(err > thr)[0]
+    if peaks.size == 0:
+        return []
+
+    pad = max(2, int(round(cfg.impulse_pad_s * sr)))
+    min_sep = max(pad, int(0.005 * sr))
+    # Rank by residual, NMS
+    order = peaks[np.argsort(-err[peaks])]
+    chosen: list[int] = []
+    for i in order:
+        if any(abs(i - j) < min_sep for j in chosen):
+            continue
+        chosen.append(int(i))
+        if len(chosen) >= 400:
+            break
+    chosen.sort()
+
+    events: list[DropoutEvent] = []
+    # Merge peaks closer than 2*pad into one span
+    if not chosen:
+        return events
+    spans: list[tuple[int, int, float]] = []
+    cur_a = max(0, chosen[0] - pad)
+    cur_b = min(n, chosen[0] + pad + 1)
+    cur_sev = _impulse_severity(float(err[chosen[0]]), float(local_mad[chosen[0]]), cfg)
+    for i in chosen[1:]:
+        a = max(0, i - pad)
+        b = min(n, i + pad + 1)
+        sev = _impulse_severity(float(err[i]), float(local_mad[i]), cfg)
+        if a <= cur_b + pad:
+            cur_b = max(cur_b, b)
+            cur_sev = max(cur_sev, sev)
+        else:
+            spans.append((cur_a, cur_b, cur_sev))
+            cur_a, cur_b, cur_sev = a, b, sev
+    spans.append((cur_a, cur_b, cur_sev))
+
+    max_len = int(round(cfg.impulse_max_dur_s * sr))
+    for a, b, sev in spans:
+        if b - a > max_len:
+            # Too long for a tick — keep center max_len
+            mid = (a + b) // 2
+            a = max(0, mid - max_len // 2)
+            b = min(n, a + max_len)
+        if b - a < 3:
+            continue
+        events.append(
+            DropoutEvent(
+                start_s=a / sr,
+                end_s=b / sr,
+                start_sample=a,
+                end_sample=b,
+                channel=channel,
+                type="impulse_click",
+                severity=float(sev),
+                confidence=float(np.clip(0.55 + 0.4 * sev, 0.0, 0.99)),
+                duration_class=duration_class((b - a) / sr),
+                notes="source tick/pop (impulse); not a tape dropout",
+            )
+        )
+    return events
+
+
+def _impulse_severity(residual: float, mad: float, cfg: DetectConfig) -> float:
+    # Map excess over threshold into 0..1
+    thr = max(cfg.impulse_mad_k * mad, cfg.impulse_abs_floor)
+    if residual <= thr:
+        return 0.0
+    # 1× over thr → ~0.5; 3× → ~1.0
+    return float(np.clip((residual / thr - 1.0) / 2.0 + 0.5, 0.0, 1.0))
 
 
 def _mask_to_spans(
