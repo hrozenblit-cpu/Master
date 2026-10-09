@@ -36,8 +36,9 @@ def _norm_mode(mode: RepairMode) -> RepairMode:
 # For dual_mono_like / full-track→two-track, longer asymmetric events can still
 # borrow from the clean sibling — see _choose_strategy.
 _MAX_DUR = {
-    "conservative": {"hard_mute": 0.080, "level_dip": 0.055, "hf_loss": 0.035, "impulse_click": 0.004},
-    "aggressive": {"hard_mute": 0.20, "level_dip": 0.25, "hf_loss": 0.30, "impulse_click": 0.012},
+    # impulse_click cap allows coalesced neighboring ticks into one OLA span
+    "conservative": {"hard_mute": 0.080, "level_dip": 0.055, "hf_loss": 0.035, "impulse_click": 0.022},
+    "aggressive": {"hard_mute": 0.20, "level_dip": 0.25, "hf_loss": 0.30, "impulse_click": 0.030},
 }
 _MAX_DUR_BORROW = {
     "conservative": {"hard_mute": 0.15, "level_dip": 0.12, "hf_loss": 0.12},
@@ -47,9 +48,9 @@ _MAX_DUR_BORROW = {
 # Conservative is intentionally high — prefer markers over inventing syllables.
 _MIN_SEVERITY = {
     # level_dip 0.72 keeps pior.wav real holes; apply-time content gate blocks voiced FPs
-    # impulse_click 0.50 catches Samba ~0:25 (sev≈0.52–0.60 after azimuth)
-    "conservative": {"hard_mute": 0.55, "level_dip": 0.72, "hf_loss": 0.92, "impulse_click": 0.50},
-    "aggressive": {"hard_mute": 0.40, "level_dip": 0.60, "hf_loss": 0.82, "impulse_click": 0.45},
+    # impulse_click 0.58 keeps Samba ~0:25 (sev≈0.66–0.73 after azimuth) while cutting mild FPs
+    "conservative": {"hard_mute": 0.55, "level_dip": 0.72, "hf_loss": 0.92, "impulse_click": 0.58},
+    "aggressive": {"hard_mute": 0.40, "level_dip": 0.60, "hf_loss": 0.82, "impulse_click": 0.48},
 }
 # Skip micro repairs that only create edge clicks (seconds).
 # impulse_click is intentionally sub-ms…few-ms — do not treat as skip_micro.
@@ -61,6 +62,10 @@ _MIN_APPLY_DUR = {
 _MERGE_GAP_S = {"conservative": 0.040, "aggressive": 0.020}
 # Cap unique dropout time-spans per second of audio (keep highest severity).
 _MAX_SPANS_PER_S = {"conservative": 0.6, "aggressive": 2.0}
+# Impulse de-clicks used to be density-exempt → ~6 splices/s carpet of crossfade ticks.
+_MAX_IMPULSE_PER_S = {"conservative": 0.45, "aggressive": 1.5}
+# Coalesce nearby impulse peaks into one OLA span (seconds).
+_IMPULSE_COALESCE_S = {"conservative": 0.018, "aggressive": 0.012}
 # Max fraction of fill vs original for non-mute strategies (vocal safety).
 _MAX_NEW_BLEND = {"conservative": 0.45, "aggressive": 0.95}
 
@@ -161,9 +166,9 @@ def plan_repairs(
             deferred += 1
             continue
 
-        # Impulse ticks are sparse micro-events — don't swallow neighbors with the
-        # dropout merge gap (was skipping Samba ~24.444 right after ~24.429).
-        gap = 0.002 if ev.type == "impulse_click" else merge_gap
+        # Impulses: allow close neighbors into the plan — apply coalesces them into one OLA.
+        # Dropouts still use the wider merge gap so dense HF doesn't stack splices.
+        gap = 0.001 if ev.type == "impulse_click" else merge_gap
         if _overlaps_claimed(ev, claimed, merge_gap_s=gap, sr=report.sample_rate):
             strategies.append(
                 _strat(ev, "skip_overlap", "deferred", reason="overlaps / within merge gap of stronger event")
@@ -254,11 +259,12 @@ def plan_repairs(
         strategies.append(s)
         claimed.append((ev.channel, ev.start_sample, ev.end_sample))
 
-    # Density throttle on dropout splices only (impulse de-clicks are tiny + must stay).
-    selected, strategies, extra_def = _throttle_density(
-        selected, strategies, report.frames / max(1, report.sample_rate), mode=mode
-    )
+    # Density throttle: dropouts first, then impulse clicks (was exempt → splice carpet).
+    dur_s = report.frames / max(1, report.sample_rate)
+    selected, strategies, extra_def = _throttle_density(selected, strategies, dur_s, mode=mode)
     deferred += extra_def
+    selected, strategies, extra_imp = _throttle_impulses(selected, strategies, dur_s, mode=mode)
+    deferred += extra_imp
 
     return RepairPlan(
         mode=mode,
@@ -297,12 +303,68 @@ def apply_repairs(
     strat_by_key = {
         (s.get("start_sample"), s.get("channel"), s.get("type")): s for s in plan.strategies if s.get("status") == "planned"
     }
-    # Skip duplicate sibling impulse already handled via linked dual-mono apply
-    done_impulse_spans: set[tuple[int, int]] = set()
+
+    # Coalesce nearby impulse clicks into one OLA span (cuts join count; Helio crossfade carpet).
+    coalesce_gap = _IMPULSE_COALESCE_S[mode]
+    impulse_spans = _coalesce_impulse_spans(
+        [e for e in order if e.type == "impulse_click"],
+        gap_s=coalesce_gap,
+        sr=sr,
+        n_frames=x.shape[0],
+    )
+    absorbed_impulse: set[tuple[int, str]] = set()
+    for span in impulse_spans:
+        for ev in span["events"]:
+            absorbed_impulse.add((ev.start_sample, ev.channel))
+        a, b = span["a"], span["b"]
+        # Widen core to cover nearby residual peaks (density may have dropped a twin tick).
+        a, b = _expand_impulse_core(x, a, b, sr, radius_s=0.020)
+        ch_set = []
+        if dual_mono and x.shape[1] >= 2:
+            ch_set = [0, 1]
+        else:
+            for e in span["events"]:
+                ci = _channel_index(e.channel, x.shape[1])
+                if ci is not None and ci not in ch_set:
+                    ch_set.append(ci)
+        try:
+            for ci in ch_set:
+                _declick_interp(x[:, ci], a, b, sr, max_new=1.0)
+            applied.append(
+                {
+                    "start_s": a / sr,
+                    "end_s": b / sr,
+                    "start_sample": a,
+                    "end_sample": b,
+                    "channel": "L+R" if len(ch_set) > 1 else ("L" if ch_set[0] == 0 else "R"),
+                    "type": "impulse_click",
+                    "strategy": "declick_interp",
+                    "note": f"ola coalesce n={len(span['events'])}",
+                }
+            )
+            for ev in span["events"]:
+                key = (ev.start_sample, ev.channel, ev.type)
+                meta = strat_by_key.get(key)
+                if meta is not None:
+                    meta["status"] = "applied"
+                    meta["strategy"] = "declick_interp"
+                    meta["note"] = "ola coalesce"
+        except Exception as exc:  # noqa: BLE001
+            for ev in span["events"]:
+                key = (ev.start_sample, ev.channel, ev.type)
+                meta = strat_by_key.get(key)
+                if meta is not None:
+                    meta["status"] = "failed"
+                    meta["reason"] = str(exc)
 
     for ev in order:
         key = (ev.start_sample, ev.channel, ev.type)
         meta = strat_by_key.get(key) or _strat(ev, _choose_strategy(ev, report, mode=mode), "planned")
+        if ev.type == "impulse_click" or (ev.start_sample, ev.channel) in absorbed_impulse:
+            if meta.get("status") == "planned":
+                meta["status"] = "applied"
+                meta["note"] = "ola coalesce"
+            continue
         strategy = meta["strategy"]
         ch_i = _channel_index(ev.channel, x.shape[1])
         if ch_i is None:
@@ -346,40 +408,21 @@ def apply_repairs(
             continue
 
         try:
-            if strategy == "declick_interp":
-                span_key = (a, b)
-                if span_key in done_impulse_spans:
-                    meta["status"] = "applied"
-                    meta["note"] = "linked dual-mono sibling"
-                    continue
-                # Strong replace on ticks; dual-mono → both channels together (no L/R pump).
-                # Do NOT seal_boundaries after declick — wide edge seal invents new ticks
-                # (Samba ~24.444 left-edge residual after removing the real impulse).
-                strength = 1.0
-                channels = [0, 1] if (dual_mono and x.shape[1] >= 2) else [ch_i]
-                for ci in channels:
-                    _declick_interp(x[:, ci], a, b, sr, max_new=strength)
-                done_impulse_spans.add(span_key)
-                meta["note"] = "linked L+R" if len(channels) > 1 else ""
-            elif strategy == "cross_channel_borrow":
+            # No _seal_boundaries after these — _blend_fill already does long equal-power
+            # edges; a second seal was inventing ticks/swish (Helio crossfade feedback).
+            if strategy == "cross_channel_borrow":
                 donor = 1 - ch_i
-                # Borrow is safer for vocals (real donor audio) — allow more replacement.
                 borrow_new = min(1.0, max_new + 0.35) if mode == "conservative" else max_new
                 _cross_channel_borrow(x, ch_i, donor, a, b, sr, max_new=borrow_new)
-                _seal_boundaries(x[:, ch_i], a, b, sr)
             elif strategy == "hf_band_reconstruct":
                 _hf_band_reconstruct(x[:, ch_i], a, b, sr)
-                _seal_boundaries(x[:, ch_i], a, b, sr)
             elif strategy == "bilateral_context":
                 _bilateral_context_fill(x[:, ch_i], a, b, sr)
-                _seal_boundaries(x[:, ch_i], a, b, sr)
             elif strategy == "stft_interp":
                 _stft_interp(x[:, ch_i], a, b, sr=sr)
-                _seal_boundaries(x[:, ch_i], a, b, sr)
             else:  # cubic_interp / mirror — keep soft on level dips (lyrics)
                 fill_new = 0.30 if (mode == "conservative" and ev.type == "level_dip") else max_new
                 _mirror_interp(x[:, ch_i], a, b, sr=sr, max_new=fill_new)
-                _seal_boundaries(x[:, ch_i], a, b, sr)
             meta["status"] = "applied"
             applied.append(
                 {
@@ -387,7 +430,7 @@ def apply_repairs(
                     "end_s": ev.end_s,
                     "start_sample": a,
                     "end_sample": b,
-                    "channel": "L+R" if (strategy == "declick_interp" and dual_mono) else ev.channel,
+                    "channel": ev.channel,
                     "type": ev.type,
                     "strategy": strategy,
                 }
@@ -395,17 +438,6 @@ def apply_repairs(
         except Exception as exc:  # noqa: BLE001
             meta["status"] = "failed"
             meta["reason"] = str(exc)
-
-    # Residual impulse pass: only near already-planned impulse spans (splice-edge ticks).
-    impulse_centers = [
-        0.5 * (float(a["start_s"]) + float(a["end_s"]))
-        for a in applied
-        if a.get("type") == "impulse_click"
-    ]
-    residual_hits = _residual_impulse_cleanup(
-        x, sr, dual_mono=dual_mono, near_times_s=impulse_centers
-    )
-    applied.extend(residual_hits)
 
     # Dual-mono / full-track→two-track: re-match L/R RMS after edits so repairs
     # never leave one channel ducked while the other is hotter (Helio "pump").
@@ -740,21 +772,148 @@ def _channel_index(tag: str, n_ch: int) -> int | None:
     return None
 
 
-def _declick_interp(ch: np.ndarray, a: int, b: int, sr: int, *, max_new: float = 0.9) -> None:
-    """Remove a short source tick/pop by smooth bridge fill + short equal-power crossfade.
+def _coalesce_impulse_spans(
+    events: list[DropoutEvent],
+    *,
+    gap_s: float,
+    sr: int,
+    n_frames: int,
+) -> list[dict[str, Any]]:
+    """Merge impulse events within gap_s into union spans for a single OLA apply."""
+    if not events:
+        return []
+    ordered = sorted(events, key=lambda e: (e.start_sample, e.channel))
+    gap = max(1, int(round(gap_s * sr)))
+    spans: list[dict[str, Any]] = []
+    cur_events = [ordered[0]]
+    cur_a = int(ordered[0].start_sample)
+    cur_b = int(ordered[0].end_sample)
+    for ev in ordered[1:]:
+        a, b = int(ev.start_sample), int(ev.end_sample)
+        if a <= cur_b + gap:
+            cur_b = max(cur_b, b)
+            cur_a = min(cur_a, a)
+            cur_events.append(ev)
+        else:
+            spans.append({"a": max(0, cur_a), "b": min(n_frames, cur_b), "events": cur_events})
+            cur_events = [ev]
+            cur_a, cur_b = a, b
+    spans.append({"a": max(0, cur_a), "b": min(n_frames, cur_b), "events": cur_events})
+    return spans
 
-    Prefer a clean cubic bridge over mirrored texture — texture re-injects the pop.
-    Edges keep a few samples of original via cosine fade so the splice is inaudible;
-    the impulse core is fully replaced.
+
+def _expand_impulse_core(
+    x: np.ndarray, a: int, b: int, sr: int, *, radius_s: float = 0.020, abs_floor: float = 0.0055
+) -> tuple[int, int]:
+    """Grow [a,b) to include nearby mid-mix residual peaks (twin ticks)."""
+    if x.ndim != 2 or x.shape[0] < 8:
+        return a, b
+    mid = 0.5 * (x[:, 0] + x[:, 1]) if x.shape[1] >= 2 else x[:, 0]
+    rad = max(4, int(round(radius_s * sr)))
+    lo = max(0, a - rad)
+    hi = min(mid.size, b + rad)
+    err = np.abs(mid[lo:hi] - 0.5 * (np.roll(mid[lo:hi], 1) + np.roll(mid[lo:hi], -1)))
+    if err.size < 3:
+        return a, b
+    err[0] = 0.0
+    err[-1] = 0.0
+    peaks = np.where(err >= abs_floor)[0]
+    if peaks.size == 0:
+        return a, b
+    pad = max(4, int(round(0.0016 * sr)))
+    a2 = min(a, lo + int(peaks.min()) - pad)
+    b2 = max(b, lo + int(peaks.max()) + pad + 1)
+    return max(0, a2), min(x.shape[0], b2)
+
+
+def _throttle_impulses(
+    selected: list[DropoutEvent],
+    strategies: list[dict[str, Any]],
+    duration_s: float,
+    *,
+    mode: RepairMode,
+) -> tuple[list[DropoutEvent], list[dict[str, Any]], int]:
+    """Cap impulse de-clicks per second, fair across the timeline.
+
+    Global top-N by severity starved late ticks (Samba ~0:25). Instead:
+    - always keep high-severity hits (true pops),
+    - density-cap milder ones in ~1.5 s slots (best severity per slot).
     """
-    n = b - a
+    if not selected or duration_s <= 0:
+        return selected, strategies, 0
+    clicks = [e for e in selected if e.type == "impulse_click"]
+    if not clicks:
+        return selected, strategies, 0
+
+    always_sev = 0.70 if mode == "conservative" else 0.58
+    strong = [e for e in clicks if e.severity >= always_sev]
+    mild = [e for e in clicks if e.severity < always_sev]
+
+    # Slot ALL clicks (strong + mild) so early FPs don't erase later real ticks,
+    # but strong ones always win their slot and are never dropped for density.
+    slot_s = 1.5
+    per_slot = max(1, int(round(_MAX_IMPULSE_PER_S[mode] * slot_s)))
+    slot_bins: dict[int, list[DropoutEvent]] = {}
+    for ev in clicks:
+        slot_bins.setdefault(int(ev.start_s // slot_s), []).append(ev)
+    kept_clicks: list[DropoutEvent] = []
+    for _slot, evs in slot_bins.items():
+        by20: dict[int, list[DropoutEvent]] = {}
+        for ev in evs:
+            by20.setdefault(int(round(ev.start_s * 50.0)), []).append(ev)
+        ranked = sorted(by20.values(), key=lambda group: -max(e.severity for e in group))
+        # Always include every strong group in this slot, plus top mild up to per_slot
+        strong_groups = [g for g in ranked if max(e.severity for e in g) >= always_sev]
+        mild_groups = [g for g in ranked if max(e.severity for e in g) < always_sev]
+        # At most one strong time-key per slot (+ expand covers twin peaks nearby)
+        for group in strong_groups[:1]:
+            kept_clicks.extend(group)
+        for group in mild_groups[: max(0, per_slot)]:
+            kept_clicks.extend(group)
+    keep_click_ids = {(e.start_sample, e.channel, e.type) for e in kept_clicks}
+    if len(keep_click_ids) >= len(clicks):
+        return selected, strategies, 0
+
+    non_clicks = [e for e in selected if e.type != "impulse_click"]
+    new_selected = non_clicks + [e for e in clicks if (e.start_sample, e.channel, e.type) in keep_click_ids]
+    deferred = 0
+    for s in strategies:
+        if s.get("status") != "planned" or s.get("type") != "impulse_click":
+            continue
+        key = (s.get("start_sample"), s.get("channel"), s.get("type"))
+        if key not in keep_click_ids:
+            s["status"] = "deferred"
+            s["strategy"] = "skip_impulse_density"
+            s["reason"] = f"impulse density cap ~{_MAX_IMPULSE_PER_S[mode]:.1f}/s (time-stratified)"
+            deferred += 1
+    return new_selected, strategies, deferred
+
+
+def _declick_interp(ch: np.ndarray, a: int, b: int, sr: int, *, max_new: float = 0.9) -> None:
+    """Remove a short tick via overlap-add Hermite fill with long equal-power wings.
+
+    Previous ~0.2 ms edge fades caused audible ticks/swish at every join (Helio).
+    Expand outside [a,b) by ~3 ms/side, fully replace the core, and equal-power
+    crossfade only in the wings — one OLA, no post-seal.
+    """
+    n_core = b - a
+    if n_core <= 0:
+        return
+    # ~3 ms wings (clamped so tiny cores still get usable fades)
+    wing = max(32, int(round(sr * 0.003)))
+    a0 = max(0, a - wing)
+    b0 = min(ch.size, b + wing)
+    fade_l = a - a0
+    fade_r = b0 - b
+    n = b0 - a0
     if n <= 0:
         return
-    left = float(ch[a - 1]) if a > 0 else float(ch[a])
-    right = float(ch[b]) if b < ch.size else float(ch[b - 1])
-    # Slope-aware cubic Hermite endpoints (flatter through tick than linear)
-    left_slope = float(ch[a - 1] - ch[a - 2]) if a >= 2 else 0.0
-    right_slope = float(ch[b + 1] - ch[b]) if b + 1 < ch.size else 0.0
+
+    # Hermite bridge across the whole OLA window using outer neighbors
+    left = float(ch[a0 - 1]) if a0 > 0 else float(ch[a0])
+    right = float(ch[b0]) if b0 < ch.size else float(ch[b0 - 1])
+    left_slope = float(ch[a0 - 1] - ch[a0 - 2]) if a0 >= 2 else 0.0
+    right_slope = float(ch[b0 + 1] - ch[b0]) if b0 + 1 < ch.size else 0.0
     t = np.linspace(0.0, 1.0, n)
     t2 = t * t
     t3 = t2 * t
@@ -762,38 +921,31 @@ def _declick_interp(ch: np.ndarray, a: int, b: int, sr: int, *, max_new: float =
     h10 = t3 - 2 * t2 + t
     h01 = -2 * t3 + 3 * t2
     h11 = t3 - t2
-    bridge = h00 * left + h10 * left_slope + h01 * right + h11 * right_slope
-    fill = bridge
-    if n >= 20:
-        ctx = max(12, min(48, n))
-        left_ctx = ch[max(0, a - ctx) : a]
-        right_ctx = ch[b : min(ch.size, b + ctx)]
-        if left_ctx.size and right_ctx.size:
-            from_l = _tile_to(left_ctx[::-1], n)
-            from_r = _tile_to(right_ctx[::-1], n)
-            tex = from_l * np.cos(0.5 * np.pi * t) + from_r * np.sin(0.5 * np.pi * t)
-            # Tiny texture only — keep the impulse out
-            fill = 0.92 * bridge + 0.08 * tex
+    fill = h00 * left + h10 * left_slope + h01 * right + h11 * right_slope
     fill = _match_endpoints(fill, left, right)
-    # Short edge fade (~0.2 ms) — long fades leave tick energy near edges
-    fade = max(2, min(max(2, n // 8), int(round(sr * 0.00025))))
-    w_new, _w_old = _fade_weights(n, fade)
+
+    # Plateau weight: 0 at outer edges → 1 across impulse core → 0
+    w = np.ones(n, dtype=np.float64)
+    if fade_l > 0:
+        tl = np.linspace(0.0, 1.0, fade_l, endpoint=True)
+        w[:fade_l] = np.sin(0.5 * np.pi * tl) ** 2
+    if fade_r > 0:
+        tr = np.linspace(0.0, 1.0, fade_r, endpoint=True)
+        w[-fade_r:] = np.cos(0.5 * np.pi * tr) ** 2
     strength = float(np.clip(max_new, 0.5, 1.0))
-    # Full replace through the impulse core
-    mid = np.sin(np.pi * t) ** 2
-    w_new = np.clip(np.maximum(w_new, mid) * strength, 0.0, 1.0)
-    w_old = 1.0 - w_new
-    ch[a:b] = w_new * fill + w_old * ch[a:b]
+    w = w * strength
+    orig = ch[a0:b0].astype(np.float64, copy=False)
+    ch[a0:b0] = w * fill + (1.0 - w) * orig
 
 
-def _fade_len(n: int, sr: int, ms: float = 8.0) -> int:
-    """Crossfade length in samples — long enough to avoid audible clicks in music."""
+def _fade_len(n: int, sr: int, ms: float = 12.0) -> int:
+    """Crossfade length in samples — prefer ≥~3 ms equal-power edges on music."""
     if n <= 2:
         return 1
     want = int(round(sr * ms / 1000.0))
-    # At least ~3 ms, at most 40% of the span (need room for both edges)
-    lo = max(32, int(round(sr * 0.003)))
-    hi = max(lo, int(n * 0.4))
+    # At least ~3 ms when span allows; at most 45% of the span (both edges)
+    lo = min(max(24, int(round(sr * 0.003))), max(1, n // 2))
+    hi = max(lo, int(n * 0.45))
     return int(np.clip(want, lo, hi))
 
 
@@ -826,30 +978,12 @@ def _match_endpoints(fill: np.ndarray, left: float, right: float) -> np.ndarray:
 
 
 def _seal_boundaries(ch: np.ndarray, a: int, b: int, sr: int) -> None:
-    """Post-repair micro-crossfade around event edges to kill residual clicks/pops."""
-    n = ch.size
-    if n < 4 or b <= a:
-        return
-    fade = _fade_len(max(8, b - a), sr, ms=4.0)
-    # Blend a short neighborhood straddling each edge back toward continuity
-    for edge in (a, b):
-        lo = max(0, edge - fade)
-        hi = min(n, edge + fade)
-        if hi - lo < 4:
-            continue
-        # Local linear bridge across the edge neighborhood
-        left = float(ch[lo])
-        right = float(ch[hi - 1])
-        t = np.linspace(0.0, 1.0, hi - lo)
-        bridge = (1.0 - t) * left + t * right
-        # Equal-power mix: keep most of signal, pull edges toward bridge
-        w = np.sin(np.pi * t) ** 2  # peaks at center/edge
-        # Stronger correction right at the boundary index
-        mid = edge - lo
-        w = np.clip(w * 0.35, 0.0, 0.35)
-        if 0 <= mid < w.size:
-            w[mid] = min(0.55, w[mid] + 0.25)
-        ch[lo:hi] = (1.0 - w) * ch[lo:hi] + w * bridge
+    """Deprecated no-op.
+
+    Older builds mixed a linear bridge over edges *after* equal-power blends,
+    inventing ticks/swish (Helio). Callers use `_blend_fill` / OLA declick only.
+    """
+    return
 
 
 def _blend_fill(
@@ -858,7 +992,7 @@ def _blend_fill(
     b: int,
     fill: np.ndarray,
     sr: int,
-    ms: float = 8.0,
+    ms: float = 12.0,
     *,
     max_new: float = 1.0,
 ) -> None:
@@ -897,7 +1031,7 @@ def _mirror_interp(
         from_r = _tile_to(right[::-1], n)
         t = np.linspace(0.0, 1.0, n)
         fill = from_l * np.cos(0.5 * np.pi * t) + from_r * np.sin(0.5 * np.pi * t)
-    _blend_fill(ch, a, b, fill, sr, ms=10.0, max_new=max_new)
+    _blend_fill(ch, a, b, fill, sr, ms=12.0, max_new=max_new)
 
 
 def _bilateral_context_fill(ch: np.ndarray, a: int, b: int, sr: int = 48000) -> None:
@@ -920,7 +1054,6 @@ def _bilateral_context_fill(ch: np.ndarray, a: int, b: int, sr: int = 48000) -> 
             t = np.linspace(0.0, 1.0, n)
             w_stft = np.sin(np.pi * t) ** 2
             ch[a:b] = (1.0 - w_stft) * backup + w_stft * ch[a:b]
-            _seal_boundaries(ch, a, b, sr)
         except Exception:  # noqa: BLE001
             ch[a:b] = backup
 
@@ -944,7 +1077,7 @@ def _cross_channel_borrow(
     rms_t = float(np.sqrt(np.mean(tgt_ctx**2) + 1e-20)) if tgt_ctx.size else 1.0
     rms_d = float(np.sqrt(np.mean(don_ctx**2) + 1e-20)) if don_ctx.size else 1.0
     scaled = src * (rms_t / max(rms_d, 1e-12))
-    _blend_fill(x[:, target], a, b, scaled, sr, ms=10.0, max_new=max_new)
+    _blend_fill(x[:, target], a, b, scaled, sr, ms=12.0, max_new=max_new)
 
 
 def _stft_interp(ch: np.ndarray, a: int, b: int, sr: int = 48000, n_fft: int = 512, hop: int = 128) -> None:
@@ -1014,7 +1147,7 @@ def _stft_interp(ch: np.ndarray, a: int, b: int, sr: int = 48000, n_fft: int = 5
     recon = out / norm
 
     fill = recon[gap_a:gap_b]
-    _blend_fill(ch, a, b, fill, sr, ms=10.0)
+    _blend_fill(ch, a, b, fill, sr, ms=12.0)
 
 
 def _hf_band_reconstruct(ch: np.ndarray, a: int, b: int, sr: int, n_fft: int = 512, hop: int = 128) -> None:

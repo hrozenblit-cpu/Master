@@ -1,5 +1,6 @@
 mtdrop — ferramenta local para dropouts de fita (Master Tools)
 ==============================================================
+Build: 2026-10-09-xfade-ola  (use este ZIP fresco — nao reaproveite pasta antiga)
 
 O codigo NAO esta no branch "main" do GitHub (la so ha um README).
 Use este ZIP (branch do PR) ou a pasta extraida dele.
