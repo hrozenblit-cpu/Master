@@ -1,6 +1,6 @@
 mtdrop — ferramenta local para dropouts de fita (Master Tools)
 ==============================================================
-Build: 2026-10-09-batch-ui-v1  (use este ZIP fresco — nao reaproveite pasta antiga)
+Build: 2026-10-09-batch-ui-v2  (use este ZIP fresco — nao reaproveite pasta antiga)
 UI: aba Lote processa varios WAVs; Samba = repair aggressive + tok/thump ~0:25 no pipeline.
 
 O codigo NAO esta no branch "main" do GitHub (la so ha um README).
@@ -35,6 +35,8 @@ COMO USAR (Windows)
    - Reparo padrao do lote = aggressive (Samba)
    - "Processar lote" — cada faixa e SALVA NA HORA em reparados\
      Nome: 01_[Nome da Musica] - [Artista] - reparado.wav
+   - O arquivo real fica em disco em reparados\; o "Download" da UI
+     e so uma copia auxiliar (se falhar, o WAV no disco ja esta OK).
 
 REQUISITOS
 ----------

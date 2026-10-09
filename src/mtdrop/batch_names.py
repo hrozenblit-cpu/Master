@@ -38,13 +38,26 @@ def title_from_filename(path: str | Path) -> str:
     return soft or stem or "sem_titulo"
 
 
-def format_index(n: int | str) -> str:
-    """Zero-pad track index to 2 digits (01, 02, …). Accepts override strings."""
+def format_index(n: int | str | float) -> str:
+    """Zero-pad track index to 2 digits (01, 02, …). Accepts override strings.
+
+    Gradio Dataframes often coerce ``\"01\"`` → ``1.0`` (float); normalize that.
+    """
+    if isinstance(n, float):
+        if n.is_integer() and 0 <= n < 10000:
+            return f"{int(n):02d}"
+        n = str(n)
     if isinstance(n, str):
         s = n.strip()
         if s.isdigit():
             return f"{int(s):02d}"
-        # keep user override if non-numeric but sanitize
+        # Gradio float → \"1.0\"
+        try:
+            f = float(s)
+            if f.is_integer() and 0 <= f < 10000:
+                return f"{int(f):02d}"
+        except ValueError:
+            pass
         return sanitize_filename_part(s, fallback="00")[:8] or "00"
     return f"{int(n):02d}"
 
