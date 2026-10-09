@@ -306,6 +306,12 @@ def _unique_path(path: Path) -> Path:
         n += 1
 
 
+def _paths_text(disk_paths: list[str]) -> str:
+    if not disk_paths:
+        return "(nenhum ainda)"
+    return "\n".join(disk_paths)
+
+
 def process_batch(
     rows: list[list[Any]] | Any,
     *,
@@ -314,23 +320,29 @@ def process_batch(
     do_correct: bool,
     repair_mode: str,
     sensitivity: str,
+    skip_existing: bool = True,
     progress: Any = None,
-) -> Iterator[tuple[list[list[str]], str, list[str], str]]:
-    """Yield (table, status, gradio_download_paths, log) after each file — save immediately.
+) -> Iterator[tuple[list[list[str]], str, str, list[str], str]]:
+    """Yield (table, status, disk_paths_text, gradio_files, log) per file.
 
-    Disk deliverables go to the user output folder. Paths yielded for Gradio ``Files``
-    are copies under a temp stage (avoids InvalidPathError on Windows).
+    Critical (Windows / Gradio InvalidPathError):
+    - Disk write under the user folder is the source of truth.
+    - Mid-batch yields return **empty** ``gradio_files`` so Gradio postprocess never
+      sees ``mtdrop-saidas\\reparados\\...`` and cannot abort the remaining rows.
+    - Only the **final** yield may attach Gradio-safe temp copies for optional download.
     """
+    empty_files: list[str] = []
+
     # Normalize dataframe input (pandas / list / numpy)
     if rows is None:
-        yield [], "Fila vazia — carregue WAVs ou informe uma pasta.", [], ""
+        yield [], "Fila vazia — carregue WAVs ou informe uma pasta.", "", empty_files, ""
         return
     if hasattr(rows, "values"):
         data = [list(r) for r in rows.values.tolist()]
     else:
         data = [list(r) for r in rows]
     if not data:
-        yield [], "Fila vazia — carregue WAVs ou informe uma pasta.", [], ""
+        yield [], "Fila vazia — carregue WAVs ou informe uma pasta.", "", empty_files, ""
         return
 
     try:
@@ -338,24 +350,34 @@ def process_batch(
     except Exception as exc:  # noqa: BLE001
         msg = _format_exc(exc)
         tb = traceback.format_exc()
-        yield [], f"ERRO ao preparar pasta de saída: {msg}", [], tb
+        yield [], f"ERRO ao preparar pasta de saida: {msg}", "", empty_files, tb
         return
 
-    # Paths safe for Gradio Files component (temp stage), not the user folder.
-    download_paths: list[str] = []
+    disk_saved: list[str] = []
+    staged_for_final: list[str] = []
     log_lines: list[str] = [
-        f"Pasta de saída (disco): {dest}",
-        "Arquivos são salvos imediatamente em disco; o download da UI é uma cópia auxiliar.",
+        f"Pasta de saida (disco): {dest}",
+        "Cada faixa e gravada em disco imediatamente. O download da UI so aparece no fim "
+        "(copias em pasta temp) — falha no download NAO cancela o lote.",
     ]
     total = len(data)
     ok = 0
     err = 0
+    skipped = 0
+
+    def _mid_yield(status: str) -> tuple[list[list[str]], str, str, list[str], str]:
+        # Never pass user-folder paths to Gradio Files mid-batch.
+        return (
+            [list(r) for r in data],
+            status,
+            _paths_text(disk_saved),
+            empty_files,
+            "\n".join(log_lines),
+        )
 
     for i, row in enumerate(data):
-        # Pad short rows
         while len(row) < 5:
             row.append("")
-        # Normalize Gradio float indices (1.0 → 01)
         num = format_index(row[0])
         data[i][0] = num
         title, artist, src_s = str(row[1]), str(row[2]), str(row[3])
@@ -367,12 +389,7 @@ def process_batch(
                 progress(overall, desc=f"[{i+1}/{total}] {src.name}")
             except TypeError:
                 progress(overall)
-        yield (
-            [list(r) for r in data],
-            f"Processando {i+1}/{total}: {src.name}",
-            list(download_paths),
-            "\n".join(log_lines),
-        )
+        yield _mid_yield(f"Processando {i+1}/{total}: {src.name}")
 
         if not src.is_file():
             msg = (
@@ -383,7 +400,19 @@ def process_batch(
             data[i][4] = f"ERRO: {msg}"
             err += 1
             log_lines.append(f"ERRO [{num}] {msg}")
-            yield [list(r) for r in data], f"Erro em {i+1}/{total}", list(download_paths), "\n".join(log_lines)
+            yield _mid_yield(f"Erro em {i+1}/{total} — continuando…")
+            continue
+
+        out_name = batch_output_filename(num, title, artist, suffix="reparado", ext=".wav")
+        planned = dest / out_name
+        if skip_existing and planned.is_file():
+            skipped += 1
+            data[i][4] = f"PULADO (ja existe) → {planned}"
+            disk_saved.append(str(planned))
+            log_lines.append(f"PULADO [{num}] ja existe: {planned}")
+            yield _mid_yield(
+                f"Progresso {i+1}/{total} — OK={ok} · pulados={skipped} · erros={err}"
+            )
             continue
 
         work: Path | None = None
@@ -396,13 +425,11 @@ def process_batch(
                 sensitivity=sensitivity,
                 work_dir=work,
             )
-            # Prefer repaired; fall back to corrected if repair off
             deliverable = summary.get("repaired_wav") or summary.get("corrected_wav")
             if not deliverable:
                 raise RuntimeError("Nenhum WAV de saida (ligue repair ou correct)")
 
-            out_name = batch_output_filename(num, title, artist, suffix="reparado", ext=".wav")
-            out_path = _unique_path(dest / out_name)
+            out_path = planned if (skip_existing or not planned.exists()) else _unique_path(planned)
             try:
                 shutil.copy2(deliverable, out_path)
             except OSError as exc:
@@ -411,7 +438,6 @@ def process_batch(
                     "(pasta bloqueada / sem permissao / caminho longo?)"
                 ) from exc
 
-            # Sidecar reports next to deliverable (same stem prefix)
             stem_base = out_path.with_suffix("")
             for key, label in (
                 ("dropouts_json", ".dropouts.json"),
@@ -425,21 +451,17 @@ def process_batch(
                     except OSError as side_exc:
                         log_lines.append(f"aviso sidecar [{num}]: {side_exc}")
 
-            # Disk save = success. Stage a Gradio-safe copy for the Files widget.
             ok += 1
+            disk_saved.append(str(out_path))
             data[i][4] = f"OK → {out_path}"
             log_lines.append(
                 f"OK [{num}] {src.name} → {out_path} "
                 f"(events={summary.get('event_count')}, repaired={summary.get('repaired_count')})"
             )
+            # Stage for *final* Gradio Files only — never mid-batch.
             staged = _stage_for_gradio_download(out_path)
             if staged is not None:
-                download_paths.append(str(staged))
-            else:
-                log_lines.append(
-                    f"aviso [{num}]: salvo em disco, mas copia para download da UI falhou "
-                    f"(arquivo OK em {out_path})"
-                )
+                staged_for_final.append(str(staged))
         except Exception as exc:  # noqa: BLE001 — continue batch
             err += 1
             msg = _format_exc(exc)
@@ -450,11 +472,8 @@ def process_batch(
             if work is not None:
                 shutil.rmtree(work, ignore_errors=True)
 
-        yield (
-            [list(r) for r in data],
-            f"Progresso {i+1}/{total} — OK={ok} · erros={err} · pasta={dest}",
-            list(download_paths),
-            "\n".join(log_lines),
+        yield _mid_yield(
+            f"Progresso {i+1}/{total} — OK={ok} · pulados={skipped} · erros={err} · pasta={dest}"
         )
 
     if progress is not None:
@@ -463,11 +482,19 @@ def process_batch(
         except TypeError:
             progress(1.0)
     final = (
-        f"Lote concluido: {ok} OK, {err} erro(s), total {total}. "
+        f"Lote concluido: {ok} OK, {skipped} pulado(s), {err} erro(s), total {total}. "
         f"Arquivos em disco: {dest}"
     )
     log_lines.append(final)
-    yield [list(r) for r in data], final, list(download_paths), "\n".join(log_lines)
+    # Final yield may include Gradio-safe temp copies. If Gradio still chokes, all
+    # disk writes already finished — Helio still has the WAVs.
+    yield (
+        [list(r) for r in data],
+        final,
+        _paths_text(disk_saved),
+        list(staged_for_final),
+        "\n".join(log_lines),
+    )
 
 
 def build_app():
@@ -520,7 +547,16 @@ def build_app():
             return [], "Nenhum WAV encontrado."
         return rows, f"{len(rows)} arquivo(s) na fila."
 
-    def run_batch(table, out_folder, dated, do_correct, repair_mode, sensitivity, progress=gr.Progress()):
+    def run_batch(
+        table,
+        out_folder,
+        dated,
+        do_correct,
+        repair_mode,
+        sensitivity,
+        skip_existing,
+        progress=gr.Progress(),
+    ):
         # Never let a Gradio download/path issue abort the generator mid-batch.
         try:
             yield from process_batch(
@@ -530,15 +566,16 @@ def build_app():
                 do_correct=bool(do_correct),
                 repair_mode=repair_mode,
                 sensitivity=sensitivity,
+                skip_existing=bool(skip_existing),
                 progress=progress,
             )
         except Exception as exc:  # noqa: BLE001
             tb = traceback.format_exc()
             msg = _format_exc(exc)
-            # Empty download list — disk saves (if any) already happened inside process_batch.
             yield (
                 table if table is not None else [],
                 f"ERRO no lote (UI): {msg}. Se os WAVs ja aparecem na pasta reparados, ignore o download da UI.",
+                "",
                 [],
                 tb,
             )
@@ -672,6 +709,10 @@ Nome de saída: `01_[Nome da Musica] - [Artista] - reparado.wav`
                         value=False,
                         label="Subpasta datada / Dated subfolder (reparados_YYYYMMDD_HHMMSS)",
                     )
+                    batch_skip = gr.Checkbox(
+                        value=True,
+                        label="Pular se ja existe 01_[…] - reparado.wav / Skip existing",
+                    )
 
                 with gr.Row():
                     batch_correct = gr.Checkbox(
@@ -691,11 +732,16 @@ Nome de saída: `01_[Nome da Musica] - [Artista] - reparado.wav`
 
                 batch_run = gr.Button("Processar lote / Run batch", variant="primary")
                 batch_status = gr.Textbox(label="Progresso do lote / Batch progress", interactive=False)
+                batch_paths = gr.Textbox(
+                    label="Arquivos salvos em disco (caminhos) / Saved on disk (paths)",
+                    lines=6,
+                    interactive=False,
+                )
                 batch_log = gr.Textbox(label="Log do lote", lines=8, interactive=False)
                 batch_downloads = gr.Files(
                     label=(
-                        "Download auxiliar (copia). O arquivo real ja esta em reparados/ no disco "
-                        "/ Auxiliary download — real file already on disk under reparados/"
+                        "Download auxiliar no FIM do lote (copias temp). "
+                        "O WAV real ja esta em reparados/ — se este painel falhar, ignore."
                     )
                 )
 
@@ -713,8 +759,9 @@ Nome de saída: `01_[Nome da Musica] - [Artista] - reparado.wav`
                         batch_correct,
                         batch_repair,
                         batch_sens,
+                        batch_skip,
                     ],
-                    outputs=[batch_table, batch_status, batch_downloads, batch_log],
+                    outputs=[batch_table, batch_status, batch_paths, batch_downloads, batch_log],
                 )
 
     return demo
