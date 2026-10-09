@@ -108,6 +108,50 @@ def test_ui_picks_next_port_when_preferred_busy() -> None:
         held.close()
 
 
+def test_bilateral_tok_detect_and_declick(tmp_path: Path) -> None:
+    """Soft bilateral mid-band tok (not a 1-sample spike) should be detected and softened."""
+    sr = 44100
+    n = int(1.2 * sr)
+    rng = np.random.default_rng(1)
+    # Mild music bed
+    t = np.arange(n) / sr
+    bed = 0.04 * np.sin(2 * np.pi * 220 * t) + 0.01 * rng.standard_normal(n)
+    # ~5 ms raised-cosine burst at ~1.8 kHz on both channels (tok/thump body)
+    center = int(0.6 * sr)
+    half = int(0.0025 * sr)
+    win = np.hanning(2 * half)
+    burst = 0.22 * win * np.sin(2 * np.pi * 1800 * np.arange(2 * half) / sr)
+    sig = bed.copy()
+    sig[center - half : center + half] += burst
+    stereo = np.stack([sig, sig * 0.99], axis=1)
+    path = tmp_path / "tok.wav"
+    sf.write(str(path), stereo, sr, subtype="PCM_16")
+
+    wav = read_wav(path)
+    report = analyze(wav, DetectConfig(detect_bilateral_toks=True, detect_impulse_clicks=False))
+    toks = [e for e in report.events if e.type == "bilateral_tok"]
+    assert toks, "expected bilateral_tok detection"
+    assert any(abs((e.start_s + e.end_s) / 2 - 0.6) < 0.02 for e in toks)
+
+    out = tmp_path / "tok.repaired.wav"
+    result = apply_repairs(wav, report, out, mode="aggressive")
+    assert any(s.get("strategy") == "declick_tok" and s.get("status") == "applied" for s in result.plan.strategies)
+    rep, _ = sf.read(str(out), always_2d=True)
+    # Mid-band envelope jump at center should drop vs source
+    from mtdrop.detect import _bandpass_fft, _smooth_abs_env
+
+    def jump(x: np.ndarray) -> float:
+        mid = 0.5 * (x[:, 0] + x[:, 1])
+        env = _smooth_abs_env(_bandpass_fft(mid, sr, 120, 2600), sr)
+        i = center
+        half_c = int(0.040 * sr)
+        excl = int(0.008 * sr)
+        ctx = np.concatenate([env[i - half_c : i - excl], env[i + excl : i + half_c]])
+        return float(env[i] / (float(np.median(ctx)) + 1e-12))
+
+    assert jump(rep) < jump(stereo) * 0.55
+
+
 def test_impulse_click_detect_and_declick(tmp_path: Path) -> None:
     """Synthetic tick in music-like noise should be detected and attenuated."""
     sr = 44100
