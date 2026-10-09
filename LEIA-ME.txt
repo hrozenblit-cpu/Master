@@ -1,0 +1,61 @@
+mtdrop — ferramenta local para dropouts de fita (Master Tools)
+==============================================================
+Build: 2026-10-09-declick-025-v2  (use este ZIP fresco — nao reaproveite pasta antiga)
+UI: para Samba, repair=aggressive ok; o de-click do estalo ~0:25 roda nos dois modos.
+
+O codigo NAO esta no branch "main" do GitHub (la so ha um README).
+Use este ZIP (branch do PR) ou a pasta extraida dele.
+
+COMO USAR (Windows)
+-------------------
+1) Extraia TODO o conteudo deste ZIP para uma pasta
+   (ex.: Documentos\mtdrop).
+
+2) Dê duplo clique em:  INSTALAR_E_ABRIR.bat
+
+3) Na primeira vez o Windows instala as dependencias Python
+   (precisa ter Python 3.10+ instalado, com "Add to PATH").
+
+4) Quando a instalacao terminar, a interface abre.
+   Leia na janela preta a linha:
+
+      mtdrop UI → http://127.0.0.1:XXXX
+
+   Abra ESSE URL no navegador (pode ser 7860, 7861, … se 7860
+   estiver ocupada).
+
+5) Carregue um WAV, marque correct/repair, clique em Run,
+   e escute original / corrigido / reparado.
+
+REQUISITOS
+----------
+- Windows 10/11
+- Python 3.10 ou superior (https://www.python.org/downloads/)
+  Marque a opcao "Add python.exe to PATH".
+
+PROBLEMAS COMUNS
+----------------
+- "Python nao encontrado": reinstale o Python marcando PATH,
+  feche e abra de novo o Explorer, e tente o .bat outra vez.
+- "Cannot find empty port" / porta ocupada:
+  1) Feche a outra janela do mtdrop (Ctrl+C) e rode o .bat de novo; ou
+  2) O script ja tenta 7860–7870 sozinho — use o URL impresso; ou
+  3) No terminal nesta pasta:
+       py -3 -m mtdrop ui --port 0
+- Antivirus bloqueando pip: permita temporariamente e repita.
+
+O arquivo WAV original NUNCA e sobrescrito.
+Saidas corrigidas/reparadas mantem a mesma taxa, bits e canais
+do arquivo de entrada (ex.: 88.2 kHz/24-bit -> 88.2/24).
+
+REPARO PADRAO
+-------------
+O modo conservative (padrao na UI) protege voz/letra: so preenche
+mudos/dips profundos e estalos curtos. Use aggressive so se o dropout
+for grave e voce aceitar fills mais invasivos.
+
+PLAYERS NA UI
+-------------
+1) Original = entrada
+2) Corrigido = so azimuth + nivel (NAO e o final)
+3) REPARADO = resultado final (alinhamento + dropouts + de-click)

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtdrop"
+version = "0.2.0"
+description = "Master Tools v1 — magnetic-tape audio dropout detector and marker exporter"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Master Tools" }]
+dependencies = [
+  "numpy>=1.26",
+  "soundfile>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+ui = ["gradio>=4.0"]
+
+[project.scripts]
+mtdrop = "mtdrop.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
